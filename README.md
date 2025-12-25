@@ -1,302 +1,280 @@
-Quantum-Inspired Annealing Factorization Solver
+Quantum Annealing Factorization with Neural Networks
 
-A classical simulation of quantum annealing for integer factorization, featuring triangle qubit encoding, machine learning-enhanced search, and incremental solving with state logging.
+A hybrid quantum-classical approach to integer factorization combining **simulated annealing**, **neural network learning**, and **transformer attention mechanisms**.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8+-blue?logo=python" alt="Python 3.8+"/>
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License"/>
-  <img src="https://img.shields.io/badge/Quantum-Inspired-purple" alt="Quantum Inspired"/>
-</p>
+![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
+![NumPy](https://img.shields.io/badge/NumPy-Required-orange.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
 
----
+## 🎯 Overview
 
-## 🌟 Overview
+This tool attempts to factorize large semiprimes (N = P × Q) using a novel combination of:
 
-This project implements a **simulated quantum annealer** that mimics the behavior of real quantum computers (like D-Wave systems) to solve the integer factorization problem. Given a semiprime `N = p × q`, it finds the prime factors `p` and `q`.
+- **Simulated Annealing** with adaptive temperature control
+- **Hourglass Neural Network** for bit pattern learning
+- **Transformer Attention** (LLM-style) for capturing long-range bit dependencies
+- **Factorization-Aware Learning** that directly optimizes for P×Q = N
 
-### How It Mimics Quantum Behavior
-
-| Quantum Effect | Classical Simulation |
-|----------------|---------------------|
-| **Quantum Tunneling** | Metropolis acceptance criterion at finite temperature |
-| **Entanglement** | Triangle qubit pairs with equality constraints |
-| **Adiabatic Evolution** | Exponential temperature cooling + incremental qubit activation |
-| **Ising Hamiltonian** | QUBO energy function: `(p×q - N)²` |
-| **Superposition** | Probabilistic bit flips with learned biases |
-| **Ground State Finding** | Energy minimization via simulated annealing |
-
----
+The system learns from every factorization attempt, building up knowledge about which bit patterns lead closer to the solution.
 
 ## ✨ Features
 
-### 🧊 Triangle Qubit Architecture
-- Each logical bit is represented by a **source-triangle pair** for error correction
-- Constraint: `triangle_state == source_state` (entanglement-like coupling)
-- Heavy penalty for constraint violations guides the search
+### 🧠 Dual Neural Architecture
+- **Hourglass Network**: Diamond-shaped architecture that compresses and expands bit patterns to learn local correlations
+- **BitTransformer**: LLM-style multi-head self-attention that captures global bit dependencies
 
-### 🌡️ Temperature-Controlled Annealing
-- **Exponential cooling schedule**: `T(t) = T₀ × (T_f/T₀)^(t/t_max)`
-- **Metropolis acceptance**: `P(accept) = exp(-ΔE/T)` for uphill moves
-- Allows escaping local minima at high temperatures
+### 🎛️ Configurable Model Presets
+| Preset | Parameters | Best For |
+|--------|------------|----------|
+| Light | ~2M | Quick iterations, testing |
+| Medium | ~8M | Balanced speed/accuracy |
+| Heavy | ~33M | Better learning |
+| Ultra | ~76M | Maximum accuracy |
 
-### 🧠 Machine Learning Enhancement
-- **Neural clause learner** predicts configuration quality
-- **Policy network** for intelligent bit selection
-- **Q-learning** for action-value estimation
-- **Trap detection** for √N proximity avoidance
+### 🔥 Adaptive Annealing
+- Auto-scaling temperature based on problem size
+- Automatic reheating when stuck in local minima
+- Metropolis acceptance with configurable leniency
 
-### 📚 Learning from Experience
-- **Clause learning**: Remembers bad configurations (SAT-solver inspired)
-- **Bit correlations**: Learns which bit combinations work well
-- **Elite population**: Maintains diverse good solutions
-- **Tabu/Nogood lists**: Avoids revisiting failed regions
+### 💾 State Persistence
+- Save/resume long-running factorization attempts
+- Neural network weights preserved between sessions
+- Transformer context memory saved
 
-### 🔄 Incremental Solving
-- Progressive qubit activation (adiabatic-style)
-- Constraint propagation from mathematical properties
-- State logging for Z3-style incremental solving
-- Checkpoint/resume support for long runs
+### 🎯 Factorization-Aware Learning
+- Learns which bits belong to P vs Q
+- Predicts product error direction (too high/too low)
+- Tracks bit-N correlations for smarter suggestions
 
----
-
-## 🚀 Quick Start
-
-### Installation
+## 📦 Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/quantum-annealing-factorizer.git
-cd quantum-annealing-factorizer
+git clone https://github.com/yourusername/quantum-annealing-factorization.git
+cd quantum-annealing-factorization
 
 # Install dependencies
 pip install numpy
 
-# Optional: Install PyTorch for neural policy network
-pip install torch
+# Optional: Install tkinter for GUI (usually included with Python)
+# Ubuntu/Debian:
+sudo apt-get install python3-tk
 ```
 
-### Basic Usage
+## 🚀 Usage
 
-```python
-from incremental_annealing_with_logging import IncrementalQuantumAnnealing
-
-# Create annealer for factoring N
-N = 143  # = 11 × 13
-annealer = IncrementalQuantumAnnealing(
-    N=N,
-    num_triangle_pairs=20,
-    initial_temp=1000.0,
-    final_temp=0.01
-)
-
-# Run the solver
-best_config, best_energy = annealer.incremental_solve(
-    num_steps=100,
-    num_reads_per_step=10
-)
-
-# Extract factors
-p, q = annealer.extract_factors_from_best_config(best_config, N)
-print(f"Factors: {p} × {q} = {N}")
-```
-
-### GUI Mode
+### GUI Mode (Recommended)
 
 ```bash
 python annealing_gui_v2.py
 ```
 
-Launches a modern Tkinter GUI with:
+The GUI provides:
 - Real-time progress visualization
-- Parameter tuning controls
-- Elite solution tracking
 - Learning statistics dashboard
+- Model preset selection
+- Bit selection strategy controls
+- State save/load functionality
 
----
-
-## 🎛️ Configuration Options
-
-### Annealer Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `N` | Required | The semiprime to factor |
-| `num_triangle_pairs` | 20 | Number of qubit pairs (auto-adjusts if too low) |
-| `initial_temp` | 1000.0 | Starting temperature for annealing |
-| `final_temp` | 0.01 | Final temperature (near-zero for exploitation) |
-| `log_file` | `"triangle_qubit_states.log"` | State logging file (None to disable) |
-
-### Solving Methods
+### CLI Mode
 
 ```python
-# Single run with restarts
-best_config, best_energy = annealer.solve_with_restarts(
-    num_restarts=10,
-    num_steps=100
+from incremental_annealing_with_logging import IncrementalQuantumAnnealing
+
+# Target number to factorize
+N = 15  # = 3 × 5
+
+# Create annealer
+annealer = IncrementalQuantumAnnealing(
+    N=N,
+    num_pairs=8,  # Number of triangle qubit pairs
+    log_file="factorization.log",
+    initial_temp=None,  # Auto-scale
+    final_temp=None,
+    state_file="state.json"
 )
 
-# Parallel solving (uses all CPU cores)
-best_config, best_energy = annealer.solve_parallel(
-    num_workers=None,  # Auto-detect
-    num_steps=100,
-    share_learning=True  # Share learned clauses between workers
+# Run until convergence
+result = annealer.solve_until_convergence(
+    state_file="state.json",
+    num_steps=1000,
+    num_reads_per_step=10,
+    max_restarts=100
 )
 
-# Run until convergence (with state persistence)
-annealer.solve_until_convergence(
-    state_file="annealing_state.json",
-    max_restarts=None,  # Run indefinitely
-    save_interval=5     # Save state every 5 restarts
-)
+if result:
+    p, q = result
+    print(f"Found factors: {p} × {q} = {p*q}")
 ```
-
----
-
-## 🔬 How It Works
-
-### 1. QUBO Encoding
-
-The factorization problem is encoded as a **Quadratic Unconstrained Binary Optimization** (QUBO):
-
-```
-Energy(config) = (decode_p(config) × decode_q(config) - N)²
-```
-
-Where:
-- First half of qubit pairs encode factor `p`
-- Second half encode factor `q`
-- Triangle qubits provide redundancy
-
-### 2. Annealing Schedule
-
-```
-Temperature: T(t) = T_initial × (T_final / T_initial)^(t / t_max)
-
-Acceptance: P(ΔE > 0) = exp(-ΔE / T)
-```
-
-At high T → explore broadly (quantum tunneling analog)
-At low T → exploit best solutions (ground state convergence)
-
-### 3. Constraint Propagation
-
-Mathematical constraints are derived automatically:
-- If N is odd → both factors must be odd (LSB = 1)
-- Low bits of `p × q` must match low bits of N
-- Modular arithmetic constraints
-
-### 4. √N Trap Avoidance
-
-For RSA semiprimes, both factors should be **far from √N**. The solver:
-- Detects when `p ≈ q ≈ √N` (the "trap")
-- Applies massive energy penalties
-- Learns to diverge toward asymmetric factors
-
----
-
-## 📊 Output Files
-
-| File | Description |
-|------|-------------|
-| `triangle_qubit_states.log` | JSON log of all qubit state transitions |
-| `annealing_state.json` | Checkpoint for resume (config, best solution, learned clauses) |
-| `z3_constraints.smt2` | Exported constraints for Z3 SMT solver |
-
----
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                 IncrementalQuantumAnnealing                 │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
-│  │  Triangle   │  │  Triangle   │  │  Triangle   │  ...    │
-│  │  Qubit Pair │  │  Qubit Pair │  │  Qubit Pair │         │
-│  │  (p bit 0)  │  │  (p bit 1)  │  │  (q bit 0)  │         │
-│  └─────────────┘  └─────────────┘  └─────────────┘         │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              MLClauseLearner (Neural Net)           │   │
-│  │  • Predicts configuration quality                   │   │
-│  │  • Trap detection (√N proximity)                    │   │
-│  │  • Suggests escape flips                            │   │
-│  └─────────────────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │   Learned    │  │    Elite     │  │    Tabu      │      │
-│  │   Clauses    │  │  Population  │  │    List      │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-├─────────────────────────────────────────────────────────────┤
-│  Temperature Schedule │ Metropolis │ Constraint Propagation │
-└─────────────────────────────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │         Bit Configuration           │
+                    │    [1,0,1,1,0,0,1,0,1,1,0,1,...]   │
+                    └─────────────────┬───────────────────┘
+                                      │
+              ┌───────────────────────┼───────────────────────┐
+              │                       │                       │
+              ▼                       ▼                       ▼
+    ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+    │   Hourglass     │     │  BitTransformer │     │     Random      │
+    │    Network      │     │   (Attention)   │     │   Exploration   │
+    │                 │     │                 │     │                 │
+    │  Input → Expand │     │  Multi-Head     │     │   Uniform       │
+    │  → Bottleneck   │     │  Self-Attention │     │   Sampling      │
+    │  → Contract     │     │  + RoPE + MoE   │     │                 │
+    │  → Output       │     │  + Context Mem  │     │                 │
+    └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+             │                       │                       │
+             └───────────────────────┼───────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────┐
+                    │      Weighted Bit Selection         │
+                    │   (Configurable % per strategy)     │
+                    └─────────────────┬───────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────┐
+                    │     Simulated Annealing Step        │
+                    │   Flip bits → Evaluate energy       │
+                    │   Metropolis accept/reject          │
+                    └─────────────────┬───────────────────┘
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────┐
+                    │      Learn from Attempt             │
+                    │   Update NN weights, correlations   │
+                    │   Track best solutions              │
+                    └─────────────────────────────────────┘
 ```
 
----
+## ⚙️ Configuration
 
-## 🧪 Examples
-
-### Factor Small Numbers
+### Bit Selection Strategy
+Control how bits are selected for flipping:
 
 ```python
-# Factor 15 = 3 × 5
-annealer = IncrementalQuantumAnnealing(N=15, num_triangle_pairs=10)
-config, energy = annealer.incremental_solve(num_steps=50)
+# In GUI or code:
+strategy = {
+    'transformer_pct': 50,   # % using transformer attention
+    'hourglass_pct': 35,     # % using hourglass network
+    'random_pct': 15         # % random exploration
+}
 ```
 
-### Factor Larger Semiprimes
-
+### Model Presets
 ```python
-# Factor 2021 = 43 × 47
-annealer = IncrementalQuantumAnnealing(
-    N=2021,
-    num_triangle_pairs=30,
-    initial_temp=5000.0
-)
-config, energy = annealer.solve_with_restarts(num_restarts=20, num_steps=200)
+# Light: Fast iteration
+model_settings = {'d_model': 128, 'num_layers': 2, 'num_heads': 4, 'num_experts': 2}
+
+# Medium: Balanced
+model_settings = {'d_model': 256, 'num_layers': 4, 'num_heads': 8, 'num_experts': 4}
+
+# Heavy: Better accuracy
+model_settings = {'d_model': 512, 'num_layers': 6, 'num_heads': 16, 'num_experts': 4}
+
+# Ultra: Maximum power
+model_settings = {'d_model': 768, 'num_layers': 8, 'num_heads': 16, 'num_experts': 8}
 ```
 
-### Resume from Checkpoint
-
+### Metropolis Acceptance
 ```python
-annealer = IncrementalQuantumAnnealing(N=143)
-checkpoint = annealer.load_checkpoint("annealing_state.json")
-# Continue solving from saved state...
+# Strict: Faster convergence, less exploration
+min_accept_prob = 0.01
+
+# Normal: Balanced
+min_accept_prob = 0.05
+
+# Lenient: More exploration, better ML learning
+min_accept_prob = 0.15
 ```
 
----
+## 📊 How It Works
+
+### 1. Triangle Qubit Encoding
+The factors P and Q are encoded as binary strings using "triangle qubits" that enforce multiplication constraints.
+
+### 2. Energy Function
+The energy function combines:
+- **Constraint violations**: Penalties for invalid qubit states
+- **Factorization error**: |P×Q - N| normalized by magnitude
+- **Symmetry penalty**: Avoids the √N trap where P ≈ Q
+
+### 3. Learning Loop
+```
+For each annealing step:
+    1. Neural networks suggest promising bit flips
+    2. Apply flip, calculate new energy
+    3. Metropolis accept/reject based on ΔE and temperature
+    4. Learn from attempt (update weights, correlations)
+    5. Track best solutions found
+```
+
+### 4. Avoiding the √N Trap
+A critical challenge is avoiding solutions where P ≈ Q ≈ √N. The system:
+- Penalizes symmetric solutions in energy function
+- Learns "escape patterns" that break symmetry
+- Uses trap-aware bit selection
+
+## 🔧 Key Classes
+
+### `BitTransformer`
+LLM-style transformer for bit sequence modeling:
+- Multi-head self-attention with RoPE encoding
+- Mixture of Experts (MoE) routing
+- Context memory for historical patterns
+- Factorization-aware output heads
+
+### `MLClauseLearner`
+Hourglass neural network for pattern learning:
+- Diamond architecture (expand → bottleneck → contract)
+- Skip connections for gradient flow
+- Trap awareness and escape learning
+- Bit correlation tracking
+
+### `IncrementalQuantumAnnealing`
+Main annealing engine:
+- Adaptive temperature schedule
+- Incremental pair activation
+- State persistence
+- Multi-strategy bit selection
 
 ## 📈 Performance Tips
 
-1. **More triangle pairs** = more precision but slower
-2. **Higher initial temperature** = better exploration, needs more steps
-3. **Use `solve_parallel()`** for multi-core speedup
-4. **Enable `share_learning=True`** to share discoveries between workers
-5. **For large N**, increase `num_steps` and `num_restarts`
+1. **Start with Medium preset** for new problems
+2. **Use Light preset** for quick exploration/testing
+3. **Increase Transformer %** for problems with complex bit dependencies
+4. **Enable lenient Metropolis** when ML learning seems stuck
+5. **Save state frequently** for long-running attempts
 
----
+## ⚠️ Limitations
 
-## 🔗 Related Work
-
-- [D-Wave Quantum Annealing](https://www.dwavesys.com/)
-- [Simulated Annealing](https://en.wikipedia.org/wiki/Simulated_annealing)
-- [QUBO Formulation](https://en.wikipedia.org/wiki/Quadratic_unconstrained_binary_optimization)
-- [Adiabatic Quantum Computing](https://en.wikipedia.org/wiki/Adiabatic_quantum_computation)
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
----
+- This is a **heuristic approach** - not guaranteed to find factors
+- Large semiprimes (1000+ bits) require significant computation
+- Memory usage scales with model size and problem size
+- The √N trap can still be challenging for balanced semiprimes
 
 ## 🤝 Contributing
 
 Contributions welcome! Areas of interest:
-- Performance optimizations
-- New learning heuristics
+- Improved energy functions
 - Better trap escape strategies
-- GPU acceleration
+- More efficient attention mechanisms
+- Parallelization improvements
 
+## 📄 License
 
+MIT License - See LICENSE file for details.
+
+## 🙏 Acknowledgments
+
+- Inspired by quantum annealing approaches to optimization
+- Transformer architecture based on "Attention Is All You Need"
+- Hourglass design inspired by pose estimation networks
+
+---
+
+**Note**: This tool is for research and educational purposes. Integer factorization of large semiprimes remains computationally hard, and this tool provides a novel hybrid approach rather than a cryptographic attack.
