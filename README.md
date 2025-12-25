@@ -1,254 +1,238 @@
-Quantum Annealing Factorization with Neural Networks
+ML-Solver: Quantum-Inspired Factorization with Machine Learning
 
-A hybrid quantum-classical approach to integer factorization combining **simulated annealing**, **neural network learning**, and **transformer attention mechanisms**.
+A hybrid quantum-classical factorization solver that combines **simulated quantum annealing** with **transformer-based machine learning** to factor large integers. Features GPU acceleration via Intel iGPU/CUDA for enhanced performance.
 
-![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![NumPy](https://img.shields.io/badge/NumPy-Required-orange.svg)
+![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.5+-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
-
-## 🎯 Overview
-
-This tool attempts to factorize large semiprimes (N = P × Q) using a novel combination of:
-
-- **Simulated Annealing** with adaptive temperature control
-- **Hourglass Neural Network** for bit pattern learning
-- **Transformer Attention** (LLM-style) for capturing long-range bit dependencies
-- **Factorization-Aware Learning** that directly optimizes for P×Q = N
-
-The system learns from every factorization attempt, building up knowledge about which bit patterns lead closer to the solution.
 
 ## ✨ Features
 
-### 🧠 Dual Neural Architecture
-- **Hourglass Network**: Diamond-shaped architecture that compresses and expands bit patterns to learn local correlations
-- **BitTransformer**: LLM-style multi-head self-attention that captures global bit dependencies
-
-### 🎛️ Configurable Model Presets
-| Preset | Parameters | Best For |
-|--------|------------|----------|
-| Light | ~2M | Quick iterations, testing |
-| Medium | ~8M | Balanced speed/accuracy |
-| Heavy | ~33M | Better learning |
-| Ultra | ~76M | Maximum accuracy |
-
-### 🔥 Adaptive Annealing
-- Auto-scaling temperature based on problem size
-- Automatic reheating when stuck in local minima
-- Metropolis acceptance with configurable leniency
-
-### 💾 State Persistence
-- Save/resume long-running factorization attempts
-- Neural network weights preserved between sessions
-- Transformer context memory saved
-
-### 🎯 Factorization-Aware Learning
-- Learns which bits belong to P vs Q
-- Predicts product error direction (too high/too low)
-- Tracks bit-N correlations for smarter suggestions
-
-## 🚀 Usage
-
-### GUI Mode (Recommended)
-
-```bash
-python annealing_gui_v2.py
-```
-
-The GUI provides:
-- Real-time progress visualization
-- Learning statistics dashboard
-- Model preset selection
-- Bit selection strategy controls
-- State save/load functionality
-
-### CLI Mode
-
-```python
-from incremental_annealing_with_logging import IncrementalQuantumAnnealing
-
-# Target number to factorize
-N = 15  # = 3 × 5
-
-# Create annealer
-annealer = IncrementalQuantumAnnealing(
-    N=N,
-    num_pairs=8,  # Number of triangle qubit pairs
-    log_file="factorization.log",
-    initial_temp=None,  # Auto-scale
-    final_temp=None,
-    state_file="state.json"
-)
-
-# Run until convergence
-result = annealer.solve_until_convergence(
-    state_file="state.json",
-    num_steps=1000,
-    num_reads_per_step=10,
-    max_restarts=100
-)
-
-if result:
-    p, q = result
-    print(f"Found factors: {p} × {q} = {p*q}")
-```
+- **🧠 Transformer-Based Learning**: LLM-style BitTransformer with multi-head attention, Mixture of Experts (MoE), RoPE embeddings, and GQA
+- **⚛️ Quantum-Inspired Annealing**: Simulated annealing with triangle qubit pairs and carry-aware bit propagation
+- **🚀 GPU Acceleration**: Intel iGPU (IPEX), NVIDIA CUDA, Apple MPS, and OpenCL support
+- **📊 Real-Time GUI**: Tkinter-based interface with live statistics, progress bars, and training metrics
+- **🎯 Coppersmith-Ready**: Optimized for finding Most Significant Bits (MSB) for lattice attacks
+- **💾 Checkpoint System**: Save/resume long-running factorization attempts
+- **🔄 Adaptive Learning**: Online learning from factorization attempts with experience replay
 
 ## 🏗️ Architecture
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         Bit Configuration           │
-                    │    [1,0,1,1,0,0,1,0,1,1,0,1,...]   │
-                    └─────────────────┬───────────────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              │                       │                       │
-              ▼                       ▼                       ▼
-    ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-    │   Hourglass     │     │  BitTransformer │     │     Random      │
-    │    Network      │     │   (Attention)   │     │   Exploration   │
-    │                 │     │                 │     │                 │
-    │  Input → Expand │     │  Multi-Head     │     │   Uniform       │
-    │  → Bottleneck   │     │  Self-Attention │     │   Sampling      │
-    │  → Contract     │     │  + RoPE + MoE   │     │                 │
-    │  → Output       │     │  + Context Mem  │     │                 │
-    └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-             │                       │                       │
-             └───────────────────────┼───────────────────────┘
-                                     │
-                                     ▼
-                    ┌─────────────────────────────────────┐
-                    │      Weighted Bit Selection         │
-                    │   (Configurable % per strategy)     │
-                    └─────────────────┬───────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────────┐
-                    │     Simulated Annealing Step        │
-                    │   Flip bits → Evaluate energy       │
-                    │   Metropolis accept/reject          │
-                    └─────────────────┬───────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────────┐
-                    │      Learn from Attempt             │
-                    │   Update NN weights, correlations   │
-                    │   Track best solutions              │
-                    └─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    ML-Solver Architecture                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐   │
+│  │   Input N   │───▶│  Triangle    │───▶│  Annealing   │   │
+│  │  (to factor)│    │  Qubit Pairs │    │    Engine    │   │
+│  └─────────────┘    └──────────────┘    └──────┬───────┘   │
+│                                                 │           │
+│                     ┌───────────────────────────┘           │
+│                     ▼                                       │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              BitTransformer (LLM-style)              │   │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │   │
+│  │  │  RoPE   │ │  GQA    │ │  MoE    │ │ SwiGLU  │   │   │
+│  │  │Embedding│ │Attention│ │ Experts │ │   FFN   │   │   │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                     │                                       │
+│                     ▼                                       │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                  Output Heads                        │   │
+│  │  • Flip Scores    • Value Estimation                │   │
+│  │  • Confidence     • Factor Attribution              │   │
+│  │  • Pair Affinity  • Product Direction               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 📋 Requirements
+
+- Python 3.10+
+- NumPy
+- Tkinter (usually included with Python)
+
+### Optional (for GPU acceleration):
+- **Intel iGPU**: `intel-extension-for-pytorch`
+- **NVIDIA GPU**: PyTorch with CUDA
+- **Apple Silicon**: PyTorch with MPS
+
+## 🚀 Installation
+
+### 1. Clone the repository
+
+### 2. Create virtual environment
+```bash
+python3 -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or: venv\Scripts\activate  # Windows
+```
+
+### 3. Install dependencies
+```bash
+pip install numpy
+
+# For Intel iGPU acceleration (recommended for Intel CPUs):
+pip install torch==2.5.1+cxx11.abi intel-extension-for-pytorch==2.5.10+xpu \
+    --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+
+# Or for NVIDIA CUDA:
+pip install torch
+
+# Or CPU-only:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 4. Install Intel GPU drivers (for Intel iGPU only)
+```bash
+# Add Intel repository
+wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+    sudo gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+    https://repositories.intel.com/gpu/ubuntu noble unified" | \
+    sudo tee /etc/apt/sources.list.d/intel-gpu.list
+
+# Install drivers
+sudo apt update
+sudo apt install -y libze1 libze-intel-gpu1 intel-opencl-icd
+```
+
+## 💻 Usage
+
+### GUI Mode (Recommended)
+```bash
+cd policy/annealing/hourglass
+python annealing_gui_v2.py
+```
+
+The GUI provides:
+- **Control Panel**: Start/stop annealing, adjust parameters
+- **Statistics Tab**: Real-time metrics, bit accuracy, MSB progress
+- **Training Tab**: Transformer architecture details, GPU status, learning progress
+- **Visualization**: Energy landscape, factor convergence
+
+### CLI Mode
+```python
+from incremental_annealing_with_logging import IncrementalQuantumAnnealing
+
+# Factor a number
+N = 15 * 17  # 255
+solver = IncrementalQuantumAnnealing(N=N)
+
+# Run solver
+best_config, best_energy = solver.solve_with_restarts(
+    num_restarts=10,
+    num_steps=100,
+    num_reads_per_step=10
+)
+
+# Get factors
+p, q = solver._decode_factors(best_config)
+print(f"Factors: {p} × {q} = {p*q}")
 ```
 
 ## ⚙️ Configuration
 
-### Bit Selection Strategy
-Control how bits are selected for flipping:
-
-```python
-# In GUI or code:
-strategy = {
-    'transformer_pct': 50,   # % using transformer attention
-    'hourglass_pct': 35,     # % using hourglass network
-    'random_pct': 15         # % random exploration
-}
-```
-
 ### Model Presets
+
+| Preset | d_model | Layers | Heads | Experts | Parameters |
+|--------|---------|--------|-------|---------|------------|
+| Micro  | 64      | 1      | 2     | 1       | ~100K      |
+| Turbo  | 128     | 2      | 4     | 2       | ~500K      |
+| Lean   | 192     | 3      | 6     | 2       | ~1.2M      |
+| Medium | 256     | 4      | 8     | 4       | ~2.5M      |
+| Heavy  | 512     | 6      | 8     | 8       | ~10M       |
+
+### Annealing Parameters
+
 ```python
-# Light: Fast iteration
-model_settings = {'d_model': 128, 'num_layers': 2, 'num_heads': 4, 'num_experts': 2}
-
-# Medium: Balanced
-model_settings = {'d_model': 256, 'num_layers': 4, 'num_heads': 8, 'num_experts': 4}
-
-# Heavy: Better accuracy
-model_settings = {'d_model': 512, 'num_layers': 6, 'num_heads': 16, 'num_experts': 4}
-
-# Ultra: Maximum power
-model_settings = {'d_model': 768, 'num_layers': 8, 'num_heads': 16, 'num_experts': 8}
+solver = IncrementalQuantumAnnealing(
+    N=your_number,
+    initial_temp=1000.0,    # Starting temperature
+    final_temp=0.1,         # Final temperature
+    cooling_rate=0.99,      # Exponential cooling
+)
 ```
 
-### Metropolis Acceptance
-```python
-# Strict: Faster convergence, less exploration
-min_accept_prob = 0.01
+## 🎯 Strategies
 
-# Normal: Balanced
-min_accept_prob = 0.05
+### For Quick Factorization (small N < 64 bits)
+- Use "Micro" or "Turbo" preset
+- Lower iteration count
+- Disable transformer learning
 
-# Lenient: More exploration, better ML learning
-min_accept_prob = 0.15
+### For Large N (2048+ bits) - Coppersmith Attack
+- Use "Lean" or "Medium" preset
+- Enable GPU acceleration
+- Focus on MSB accuracy (visible in GUI)
+- Export partial results for lattice methods
+
+## 📈 GPU Acceleration
+
+The solver automatically detects and uses available GPU:
+
+```
+[GPU] ✅ Intel IPEX with XPU (Intel iGPU) available
+[GPU]    Device: Intel(R) UHD Graphics 770
+[BitTransformer] 🚀 Preloading weights to intel_ipex...
+[BitTransformer] ✅ Weights cached on GPU
 ```
 
-## 📊 How It Works
+### Supported Backends
+| Backend | GPU Type | Package |
+|---------|----------|---------|
+| `intel_ipex` | Intel iGPU | `intel-extension-for-pytorch` |
+| `torch_cuda` | NVIDIA | `torch` with CUDA |
+| `torch_mps` | Apple Silicon | `torch` |
+| `cupy` | NVIDIA | `cupy` |
 
-### 1. Triangle Qubit Encoding
-The factors P and Q are encoded as binary strings using "triangle qubits" that enforce multiplication constraints.
+## 📁 Project Structure
 
-### 2. Energy Function
-The energy function combines:
-- **Constraint violations**: Penalties for invalid qubit states
-- **Factorization error**: |P×Q - N| normalized by magnitude
-- **Symmetry penalty**: Avoids the √N trap where P ≈ Q
-
-### 3. Learning Loop
 ```
-For each annealing step:
-    1. Neural networks suggest promising bit flips
-    2. Apply flip, calculate new energy
-    3. Metropolis accept/reject based on ΔE and temperature
-    4. Learn from attempt (update weights, correlations)
-    5. Track best solutions found
+ML-Solver/
+├── policy/
+│   └── annealing/
+│       └── hourglass/
+│           ├── incremental_annealing_with_logging.py  # Core solver
+│           ├── annealing_gui_v2.py                    # GUI interface
+│           └── checkpoints/                           # Saved states
+├── venv/                                              # Virtual environment
+└── README.md
 ```
 
-### 4. Avoiding the √N Trap
-A critical challenge is avoiding solutions where P ≈ Q ≈ √N. The system:
-- Penalizes symmetric solutions in energy function
-- Learns "escape patterns" that break symmetry
-- Uses trap-aware bit selection
+## 🔬 Technical Details
 
-## 🔧 Key Classes
+### BitTransformer Components
+- **RoPE (Rotary Position Embedding)**: Encodes bit position information
+- **GQA (Grouped Query Attention)**: Efficient multi-head attention
+- **MoE (Mixture of Experts)**: Specialized expert networks for different bit patterns
+- **SwiGLU**: Gated activation in feed-forward layers
+- **RMSNorm**: Faster layer normalization
 
-### `BitTransformer`
-LLM-style transformer for bit sequence modeling:
-- Multi-head self-attention with RoPE encoding
-- Mixture of Experts (MoE) routing
-- Context memory for historical patterns
-- Factorization-aware output heads
+### Learning Features
+- Online learning from factorization attempts
+- Experience replay buffer
+- Adaptive exploration rate
+- Context memory for past configurations
+- Correlation analysis between bits
 
-### `MLClauseLearner`
-Hourglass neural network for pattern learning:
-- Diamond architecture (expand → bottleneck → contract)
-- Skip connections for gradient flow
-- Trap awareness and escape learning
-- Bit correlation tracking
+## 📊 Output Metrics
 
-### `IncrementalQuantumAnnealing`
-Main annealing engine:
-- Adaptive temperature schedule
-- Incremental pair activation
-- State persistence
-- Multi-strategy bit selection
-
-## 📈 Performance Tips
-
-1. **Start with Medium preset** for new problems
-2. **Use Light preset** for quick exploration/testing
-3. **Increase Transformer %** for problems with complex bit dependencies
-4. **Enable lenient Metropolis** when ML learning seems stuck
-5. **Save state frequently** for long-running attempts
-
-## ⚠️ Limitations
-
-- This is a **heuristic approach** - not guaranteed to find factors
-- Large semiprimes (1000+ bits) require significant computation
-- Memory usage scales with model size and problem size
-- The √N trap can still be challenging for balanced semiprimes
+- **Bit Accuracy**: Percentage of bits matching between P×Q and N
+- **MSB Match**: Most significant bits correct (critical for Coppersmith)
+- **Energy**: Combined constraint satisfaction score
+- **Diff**: |P×Q - N| (goal is 0)
 
 ## 🤝 Contributing
 
 Contributions welcome! Areas of interest:
-- Improved energy functions
-- Better trap escape strategies
-- More efficient attention mechanisms
-- Parallelization improvements
+- Additional GPU backends
+- Improved learning algorithms
+- Better initialization strategies
+- Coppersmith integration
 
 ## 📄 License
 
@@ -256,10 +240,11 @@ MIT License - See LICENSE file for details.
 
 ## 🙏 Acknowledgments
 
-- Inspired by quantum annealing approaches to optimization
-- Transformer architecture based on "Attention Is All You Need"
-- Hourglass design inspired by pose estimation networks
+- Inspired by quantum annealing approaches to factorization
+- Transformer architecture based on modern LLM designs
+- GPU acceleration via Intel Extension for PyTorch
 
 ---
 
-**Note**: This tool is for research and educational purposes. Integer factorization of large semiprimes remains computationally hard, and this tool provides a novel hybrid approach rather than a cryptographic attack.
+**Note**: This is a research tool for exploring hybrid quantum-classical factorization approaches. It is not intended to break real-world cryptographic systems.
+
