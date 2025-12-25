@@ -35,8 +35,8 @@ def _parallel_annealing_worker(args: dict) -> dict:
         N=args['N'],
         num_triangle_pairs=args['num_pairs'],
         log_file=None,  # Disable logging for workers
-        initial_temp=args.get('initial_temp', 1000.0),
-        final_temp=args.get('final_temp', 0.01)
+        initial_temp=args.get('initial_temp'),  # None = auto-scale by N
+        final_temp=args.get('final_temp')       # None = auto-scale by N
     )
     
     # Initialize with shared patterns if provided
@@ -1701,7 +1701,7 @@ class IncrementalTriangleQubitPair:
             self.energy_contribution = 0.0  # No penalty
         else:
             # Penalize constraint violations (source != triangle means inconsistency)
-            self.energy_contribution = 1000000.0  # Large penalty for violation
+            self.energy_contribution = 10.0  # Normalized penalty for violation
     
     def get_state_dict(self) -> Dict:
         """Get current state as dictionary."""
@@ -1737,8 +1737,8 @@ class IncrementalQuantumAnnealing:
     
     def __init__(self, N: int, num_triangle_pairs: int = 20, 
                  log_file: str = "triangle_qubit_states.log",
-                 initial_temp: float = 1000.0,
-                 final_temp: float = 0.01,
+                 initial_temp: float = None,
+                 final_temp: float = None,
                  state_file: str = None):
         """
         Initialize annealing solver.
@@ -1747,12 +1747,37 @@ class IncrementalQuantumAnnealing:
             N: Number to factor
             num_triangle_pairs: Number of triangle qubit pairs
             log_file: Log file for triangle states
-            initial_temp: Starting temperature
-            final_temp: Ending temperature
+            initial_temp: Starting temperature (auto-scaled by N if None)
+            final_temp: Ending temperature (auto-scaled by N if None)
             state_file: If provided, load existing state from this file BEFORE initializing
         """
         self.N = N
         self._state_file = state_file  # Store for later use
+        
+        # AUTO-SCALE TEMPERATURE BASED ON N's SIZE
+        # Larger N = larger search space = needs higher initial temperature
+        n_bits = N.bit_length()
+        self.n_bits = n_bits  # Store for reference
+        
+        if initial_temp is None:
+            # Scale initial temp based on problem size
+            # Base: 100 for ~10-bit numbers, scales up logarithmically
+            # For RSA-2048 (~2048 bits): ~2000
+            # For small numbers (~10 bits): ~100
+            initial_temp = 100.0 * (1 + np.log2(max(n_bits, 1)))
+            # Clamp to reasonable range
+            initial_temp = max(100.0, min(initial_temp, 5000.0))
+        
+        if final_temp is None:
+            # Final temp also scales, but much smaller
+            # Want to explore more for larger problems
+            final_temp = 0.001 * (1 + np.log2(max(n_bits, 1)))
+            # Clamp to reasonable range
+            final_temp = max(0.001, min(final_temp, 1.0))
+        
+        # Store the auto-computed temps for later use
+        self._auto_initial_temp = initial_temp
+        self._auto_final_temp = final_temp
         
         # NEW ENCODING: Need pairs for BOTH p and q independently
         # Each factor needs ceil(log2(sqrt(N))) bits
@@ -1789,11 +1814,12 @@ class IncrementalQuantumAnnealing:
         self.current_config = None
         self.current_energy = float('inf')
         
-        # NEW: Temperature schedule parameters
-        self.initial_temp = initial_temp
-        self.final_temp = final_temp
-        self.current_temp = initial_temp
-        print(f"[Temperature] Initial: {initial_temp:.2f}, Final: {final_temp:.4f}")
+        # NEW: Temperature schedule parameters (auto-scaled by N)
+        self.initial_temp = self._auto_initial_temp
+        self.final_temp = self._auto_final_temp
+        self.current_temp = self.initial_temp
+        print(f"[Temperature] Auto-scaled for {n_bits}-bit N:")
+        print(f"  Initial: {self.initial_temp:.2f}, Final: {self.final_temp:.6f}")
         
         # NEW: Constraint propagation tracking
         self.fixed_bits = {}  # bit_index -> fixed_value (0 or 1)
@@ -2890,63 +2916,7 @@ class IncrementalQuantumAnnealing:
                 self.successful_sequences.sort(key=lambda x: -x[1])
                 self.successful_sequences = self.successful_sequences[:250]
         
-        # =====================================================================
-        # BIT-N CORRELATION LEARNING (actual impact on p*q relative to N)
-        # =====================================================================
-        if bit_idx < len(self.bit_correlation_0to1):
-            # Calculate signed impact: positive = moved away from N, negative = moved toward N
-            # Use bit-length for magnitude to handle huge integers
-            signed_impact = float(new_bits - old_bits)  # Positive = got worse (farther from N)
-            
-            # Track directional correlation statistics
-            if old_val == 0 and new_val == 1:
-                # 0->1 flip: track impact
-                stats = self.bit_correlation_0to1[bit_idx]
-                stats[0] += signed_impact           # sum
-                stats[1] += signed_impact ** 2      # sum of squares
-                stats[2] += 1                        # count
-            else:
-                # 1->0 flip: track impact  
-                stats = self.bit_correlation_1to0[bit_idx]
-                stats[0] += signed_impact
-                stats[1] += signed_impact ** 2
-                stats[2] += 1
-            
-            # Update bit impact magnitude (how much this bit affects the product)
-            abs_impact = abs(signed_impact)
-            if abs_impact > 0:
-                # Exponential moving average of absolute impact
-                alpha = 0.1
-                self.bit_impact_magnitude[bit_idx] = (1 - alpha) * self.bit_impact_magnitude[bit_idx] + alpha * abs_impact
-            
-            # If we have product information, track signed relationship with N
-            if old_product is not None and new_product is not None and self.N is not None:
-                # Calculate how the flip changed the signed error (product - N)
-                old_signed_error = old_product - self.N
-                new_signed_error = new_product - self.N
-                
-                # Key insight: how did this flip affect the signed error?
-                # If flipping 0->1 made (p*q - N) more positive: bit contributes positively to product
-                # If flipping 0->1 made (p*q - N) more negative: bit contributes negatively to product
-                error_change = new_signed_error - old_signed_error  # In bit-length terms
-                if isinstance(error_change, int) and abs(error_change) > 0:
-                    error_change_bits = error_change.bit_length() * (1 if error_change > 0 else -1)
-                else:
-                    error_change_bits = 0
-                
-                # Update bit-N correlation: does this bit being 1 push product UP or DOWN?
-                if old_val == 0 and new_val == 1:
-                    # Setting bit to 1 caused error_change - this tells us the bit's "weight"
-                    correlation_update = error_change_bits
-                else:
-                    # Setting bit to 0 caused error_change - opposite interpretation
-                    correlation_update = -error_change_bits
-                
-                # EMA update of bit-N correlation
-                alpha = 0.1
-                self.bit_n_correlation_count[bit_idx] += 1
-                weight = min(1.0, 1.0 / (1 + self.bit_n_correlation_count[bit_idx] * 0.01))  # Decay learning rate
-                self.bit_n_correlation[bit_idx] = (1 - alpha * weight) * self.bit_n_correlation[bit_idx] + alpha * weight * correlation_update
+        # Correlation tracking is handled by MLClauseLearner.learn_correlation_from_observation()
     
     def _get_state_features(self, config: np.ndarray) -> tuple:
         """Extract key features from state for state-action learning."""
@@ -4179,7 +4149,8 @@ class IncrementalQuantumAnnealing:
             # Add additional violation penalty for non-perfect factorizations
             violations = sum(1 for p in self.pairs[:pairs_to_activate] if not p.constraint_satisfied)
             if violations > 0:
-                violation_penalty = violations * 10000000.0  # Massive penalty per violation
+                # Normalized penalty: 5 points per violation, scaled by fraction of pairs
+                violation_penalty = violations * 5.0
                 total_energy += violation_penalty
             
             # LEARNING: Apply both positive and negative learning to energy
@@ -4248,8 +4219,8 @@ class IncrementalQuantumAnnealing:
         
         # Handle edge cases
         if p == 0 or q == 0:
-            # Zero factors - very large penalty
-            return 1000000000.0
+            # Zero factors - strong but normalized penalty
+            return 500.0
         
         if p > 0 and q > 0:
             try:
@@ -4312,28 +4283,31 @@ class IncrementalQuantumAnnealing:
                                 if diff > 0:
                                     # Count how many bits differ (approximate)
                                     diff_bits = diff.bit_length()
-                                    # Very strong penalty - must be exact
-                                    penalty = diff_bits * 1000000.0
+                                    # NORMALIZED penalty - scale relative to N's bit length
+                                    # This keeps energy in a range compatible with temperature
+                                    n_bits = self.N.bit_length()
+                                    # Penalty is proportional to fraction of bits wrong
+                                    penalty = (diff_bits / max(n_bits, 1)) * 100.0  # 0-100 range
                                 else:
                                     penalty = 0.0
                                 
                                 # ANTI-SYMMETRY PENALTY: Prevent p = q trap
-                                # For RSA/semiprimes, p ≠ q, so add MASSIVE penalty if p ≈ q
+                                # For RSA/semiprimes, p ≠ q, so add penalty if p ≈ q
                                 if p_int > 0 and q_int > 0:
                                     p_q_diff = abs(p_int - q_int)
                                     max_factor = max(p_int, q_int)
                                     if max_factor > 0:
                                         relative_pq_diff = p_q_diff / max_factor
-                                        # MUCH stronger penalty - 10% threshold, massive multiplier
-                                        if relative_pq_diff < 0.10:  # 10% threshold (was 1%)
-                                            # MASSIVE penalty - scales with how close p is to q
-                                            symmetry_penalty = (0.10 - relative_pq_diff) * 1000000000.0  # 10x larger
+                                        # Normalized penalty - 10% threshold
+                                        if relative_pq_diff < 0.10:
+                                            # Penalty 0-50 range based on how close p is to q
+                                            symmetry_penalty = (0.10 - relative_pq_diff) / 0.10 * 50.0
                                             penalty += symmetry_penalty
                                         # Extra penalty if p == q exactly
                                         if p_int == q_int:
-                                            penalty += 10000000000.0  # 10 billion extra for exact match
+                                            penalty += 100.0  # Strong but not astronomical
                                 
-                                # SQRT(N) PROXIMITY PENALTY - HUGE penalty for large numbers near sqrt(N)
+                                # SQRT(N) PROXIMITY PENALTY - penalty for factors near sqrt(N)
                                 # RSA factors should be FAR from sqrt(N) - close factors are a TRAP
                                 if hasattr(self, 'ml_clause_learner') and self.ml_clause_learner.sqrt_N:
                                     sqrt_N = self.ml_clause_learner.sqrt_N
@@ -4344,42 +4318,43 @@ class IncrementalQuantumAnnealing:
                                     q_dist_bits = q_dist.bit_length() if q_dist > 0 else 0
                                     
                                     # HARD REJECTION: If both factors are within ~50% of sqrt(N) bits, REJECT
-                                    # For RSA-2048 (~1024 bit sqrt), this means within ~512 bits
-                                    critical_threshold = sqrt_bits // 2  # ~512 bits for RSA-2048
+                                    critical_threshold = sqrt_bits // 2
                                     if p_dist_bits < critical_threshold and q_dist_bits < critical_threshold:
                                         print(f"  [SQRT TRAP] 🚫 REJECTED! p_dist={p_dist_bits}bits, q_dist={q_dist_bits}bits < threshold={critical_threshold}bits")
                                         return float('inf')  # INFINITE PENALTY - NEVER ACCEPT
                                     
-                                    # For RSA-2048, factors should be ~500+ bits from sqrt(N)
-                                    # Penalty if within ~40% of bits from sqrt(N) - WIDER DANGER ZONE
-                                    danger_threshold = (sqrt_bits * 2) // 5  # ~400 bits for RSA-2048
+                                    # Normalized proximity penalty (0-100 range)
+                                    danger_threshold = (sqrt_bits * 2) // 5
                                     
                                     if p_dist_bits < danger_threshold:
                                         closeness = (danger_threshold - p_dist_bits) / danger_threshold
-                                        # MASSIVE penalty - scales with closeness^3 for extra severity
-                                        penalty += closeness * closeness * closeness * 1000000000000.0  # 1 trillion base
+                                        # Penalty 0-50 based on closeness
+                                        penalty += closeness * closeness * 50.0
                                     if q_dist_bits < danger_threshold:
                                         closeness = (danger_threshold - q_dist_bits) / danger_threshold
-                                        penalty += closeness * closeness * closeness * 1000000000000.0
+                                        penalty += closeness * closeness * 50.0
                                     
-                                    # EXTRA MASSIVE penalty if BOTH near sqrt(N)
+                                    # Extra penalty if BOTH near sqrt(N)
                                     if p_dist_bits < danger_threshold and q_dist_bits < danger_threshold:
                                         combined_closeness = ((danger_threshold - p_dist_bits) + (danger_threshold - q_dist_bits)) / (2 * danger_threshold)
-                                        penalty += combined_closeness * combined_closeness * combined_closeness * 100000000000000.0  # 100 trillion!
+                                        penalty += combined_closeness * combined_closeness * 100.0
                             else:
                                 penalty = 0.0
                         except:
-                            # Fallback: use ratio with very strong penalty
+                            # Fallback: use ratio with normalized penalty
                             try:
                                 if product > self.N:
                                     ratio = math.log2(product) - math.log2(self.N)
                                 else:
                                     ratio = math.log2(self.N) - math.log2(product)
-                                penalty = abs(ratio) * 1000000.0
+                                # Normalized: ratio of 1 bit = 10 penalty points
+                                penalty = abs(ratio) * 10.0
                             except:
-                                penalty = 1000000.0
+                                penalty = 100.0
                     else:
-                        penalty = bit_diff * 100000.0
+                        # Normalized: penalty proportional to bits off vs total bits
+                        n_bits = max(self.N.bit_length(), 1)
+                        penalty = (bit_diff / n_bits) * 200.0
                 else:
                     # Small enough for direct calculation
                     # IMPROVED ENERGY FUNCTION: Multiple components
@@ -4408,15 +4383,15 @@ class IncrementalQuantumAnnealing:
                         max_factor = max(p_int, q_int)
                         if max_factor > 0:
                             relative_pq_diff = p_q_diff / max_factor
-                            # VERY strong penalty when p ≈ q (within 5%)
+                            # Strong penalty when p ≈ q (within 5%)
                             # Real RSA factors typically differ by more than this
                             if relative_pq_diff < 0.05:
-                                # Exponentially increasing penalty as p approaches q
+                                # Penalty as p approaches q (normalized)
                                 closeness = (0.05 - relative_pq_diff) / 0.05  # 0 to 1
-                                symmetry_penalty = closeness * closeness * product_error * 500.0
-                            # MASSIVE extra penalty if p == q exactly
+                                symmetry_penalty = closeness * closeness * 50.0
+                            # Extra penalty if p == q exactly
                             if p_int == q_int:
-                                symmetry_penalty += product_error * 10000.0
+                                symmetry_penalty += 100.0
                     
                     # 5. SQRT(N) PROXIMITY PENALTY - HUGE penalty for factors near sqrt(N)
                     # For RSA/semiprimes, real factors are intentionally FAR from sqrt(N)
@@ -4444,18 +4419,18 @@ class IncrementalQuantumAnnealing:
                             SQRT_DANGER_ZONE = 0.40  # 40% threshold (was 25%)
                             
                             if p_rel_dist < SQRT_DANGER_ZONE:
-                                # CUBIC penalty - closer = MUCH MUCH worse
+                                # Normalized cubic penalty
                                 closeness = (SQRT_DANGER_ZONE - p_rel_dist) / SQRT_DANGER_ZONE
-                                sqrt_n_penalty += closeness * closeness * closeness * product_error * 50000.0
+                                sqrt_n_penalty += closeness * closeness * closeness * 50.0
                                 
                             if q_rel_dist < SQRT_DANGER_ZONE:
                                 closeness = (SQRT_DANGER_ZONE - q_rel_dist) / SQRT_DANGER_ZONE
-                                sqrt_n_penalty += closeness * closeness * closeness * product_error * 50000.0
+                                sqrt_n_penalty += closeness * closeness * closeness * 50.0
                                 
-                            # EXTRA MASSIVE penalty if BOTH are near sqrt(N) - this is the worst case
+                            # Extra penalty if BOTH are near sqrt(N)
                             if p_rel_dist < SQRT_DANGER_ZONE and q_rel_dist < SQRT_DANGER_ZONE:
                                 both_closeness = ((SQRT_DANGER_ZONE - p_rel_dist) + (SQRT_DANGER_ZONE - q_rel_dist)) / (2 * SQRT_DANGER_ZONE)
-                                sqrt_n_penalty += both_closeness * both_closeness * both_closeness * product_error * 500000.0
+                                sqrt_n_penalty += both_closeness * both_closeness * both_closeness * 100.0
                                 
                         except (OverflowError, ValueError):
                             # For huge numbers, use bit-length comparison
@@ -4473,17 +4448,22 @@ class IncrementalQuantumAnnealing:
                             danger_threshold = (sqrt_bits * 2) // 5
                             if p_dist_bits < danger_threshold:
                                 closeness = (danger_threshold - p_dist_bits) / danger_threshold
-                                sqrt_n_penalty += closeness * closeness * closeness * 1000000000000.0
+                                sqrt_n_penalty += closeness * closeness * closeness * 50.0
                             if q_dist_bits < danger_threshold:
                                 closeness = (danger_threshold - q_dist_bits) / danger_threshold
-                                sqrt_n_penalty += closeness * closeness * closeness * 1000000000000.0
+                                sqrt_n_penalty += closeness * closeness * closeness * 50.0
                     
-                    # Combined penalty (product error is most important)
-                    penalty = (product_error * 100.0 +  # Most important
-                              balance_penalty * 0.1 +    # Gentle guidance toward sqrt(N)
-                              parity_penalty +           # Moderate parity enforcement
-                              symmetry_penalty +         # Prevent p=q trap
-                              sqrt_n_penalty)            # HUGE penalty for factors near sqrt(N)
+                    # Combined penalty - NORMALIZED to work with temperature schedule
+                    # Scale product_error relative to N to keep in reasonable range
+                    n_bits = max(self.N.bit_length(), 1)
+                    error_bits = product_error.bit_length() if product_error > 0 else 0
+                    normalized_error = (error_bits / n_bits) * 100.0  # 0-100 range
+                    
+                    penalty = (normalized_error +           # Most important (0-100)
+                              balance_penalty * 0.1 +       # Gentle guidance
+                              parity_penalty +              # Moderate parity (0-50)
+                              symmetry_penalty +            # Prevent p=q (0-150)
+                              sqrt_n_penalty)               # Sqrt(N) proximity (0-200)
                 
                 return float(penalty)
             except (OverflowError, ValueError, AttributeError):
@@ -4496,10 +4476,11 @@ class IncrementalQuantumAnnealing:
                 except:
                     log_product = 0
                 log_target = self.N.bit_length()
-                penalty = abs(log_product - log_target) * 10000.0
+                # Normalized: difference in bits as fraction of total
+                penalty = (abs(log_product - log_target) / max(log_target, 1)) * 100.0
                 return float(penalty)
         
-        return 1000000.0  # Large penalty for invalid factors
+        return 200.0  # Normalized penalty for invalid factors
     
     def incremental_solve(self, num_steps: int = 100, 
                          checkpoint_interval: int = 10,
