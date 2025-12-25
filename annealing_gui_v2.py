@@ -1383,13 +1383,26 @@ Tips:
         
         if self.annealer and hasattr(self.annealer, 'elite_population'):
             for i, elite in enumerate(self.annealer.elite_population):
+                # Safely format energy (may be too large for float)
+                energy = elite.get('energy', 0)
+                try:
+                    # Check if integer is too large for float (max ~1.8e308)
+                    if isinstance(energy, int) and abs(energy) > 10**308:
+                        # For extremely large integers, use string representation with magnitude
+                        energy_str = f"~10^{len(str(abs(energy)))-1}"
+                    else:
+                        energy_str = f"{float(energy):.2f}"
+                except (OverflowError, ValueError):
+                    # Fallback: convert to string directly without float conversion
+                    energy_str = str(energy)[:15] + "..." if len(str(energy)) > 15 else str(energy)
+                
                 self.elite_tree.insert('', 'end', values=(
                     i + 1,
                     elite.get('p', '?'),
                     elite.get('q', '?'),
                     elite.get('p', 0) * elite.get('q', 0),
                     elite.get('diff', '?'),
-                    f"{elite.get('energy', 0):.2f}"
+                    energy_str
                 ))
     
     def refresh_learning(self):
@@ -1436,14 +1449,23 @@ Tips:
         self.strategy_text.insert(tk.END, f"  Nogood patterns: {len(getattr(self.annealer, 'nogood_patterns', []))}\n")
         self.strategy_text.insert(tk.END, f"  Bad bit combos: {len(getattr(self.annealer, 'bad_bit_combos', {}))}\n")
         
-        # Helper to format big numbers
+        # Helper to format big numbers (handles huge ints without float overflow)
         def fmt(n):
             if n == float('inf') or n == 'N/A':
                 return "∞"
-            if isinstance(n, (int, float)) and n > 1e9:
-                exp = len(str(int(n))) - 1
-                mantissa = n / (10 ** exp)
-                return f"{mantissa:.2f}e{exp}"
+            if isinstance(n, int) and n > 10**15:
+                # Use string manipulation for huge ints to avoid float overflow
+                s = str(n)
+                exp = len(s) - 1
+                mantissa_str = s[0] + "." + s[1:3]
+                return f"{mantissa_str}e{exp}"
+            if isinstance(n, (int, float)) and abs(n) > 1e9:
+                try:
+                    exp = len(str(int(abs(n)))) - 1
+                    mantissa = n / (10 ** exp)
+                    return f"{mantissa:.2f}e{exp}"
+                except OverflowError:
+                    return f"~10^{len(str(n))-1}"
             return str(int(n) if isinstance(n, float) else n)
         
         bad_thresh = getattr(self.annealer, 'very_bad_threshold', float('inf'))
