@@ -909,8 +909,19 @@ class BitTransformer:
         
         # =====================================================================
         # CONTEXT ATTENTION (attend to past configurations)
+        # OPTIMIZATION: Skip context attention 80% of the time for speed
         # =====================================================================
-        if len(self.context_memory) > 0 and self.context_embeddings is not None:
+        use_context = (len(self.context_memory) > 0 and 
+                       self.context_embeddings is not None and
+                       not getattr(self, '_context_dirty', True))
+        
+        # Only use context every 5th forward pass (20% of time) for speed
+        if not hasattr(self, '_forward_counter'):
+            self._forward_counter = 0
+        self._forward_counter += 1
+        use_context = use_context and (self._forward_counter % 5 == 0)
+        
+        if use_context:
             # Cross-attention to context (simplified for context_embeddings shape)
             x_norm, ln_ctx_cache = self._layer_norm(x, self.ln_context_gamma, self.ln_context_beta)
             
@@ -1359,42 +1370,65 @@ class BitTransformer:
         if len(self.context_memory) > self.max_context:
             self.context_memory = self.context_memory[-self.max_context:]
         
-        # Update context embeddings (lazy - do on next forward if needed)
-        self._update_context_embeddings()
+        # OPTIMIZATION: Mark context as dirty, don't recompute immediately
+        # Will be recomputed lazily on next forward pass that needs it
+        self._context_dirty = True
+        
+        # Only recompute every N additions to reduce overhead
+        if not hasattr(self, '_context_update_counter'):
+            self._context_update_counter = 0
+        self._context_update_counter += 1
+        
+        # Update every 50 additions or when improved (important sample)
+        if improved or self._context_update_counter >= 50:
+            self._update_context_embeddings()
+            self._context_update_counter = 0
     
     def _update_context_embeddings(self):
-        """Update cached context embeddings."""
+        """Update cached context embeddings. OPTIMIZED: Batched operations."""
         if len(self.context_memory) == 0:
             self.context_embeddings = None
+            self._context_dirty = False
             return
         
-        # Embed each context configuration
-        embeddings = []
-        for ctx in self.context_memory[-self.max_context:]:
+        # OPTIMIZATION: Limit context size for speed (use most recent only)
+        max_ctx_for_speed = min(100, self.max_context)  # Cap at 100 for speed
+        recent_ctx = self.context_memory[-max_ctx_for_speed:]
+        ctx_count = len(recent_ctx)
+        
+        # OPTIMIZATION: Batch all configs into one array for vectorized embedding
+        configs = np.zeros((ctx_count, self.num_bits), dtype=np.int32)
+        weights = np.zeros(ctx_count, dtype=np.float32)
+        
+        for i, ctx in enumerate(recent_ctx):
             config = ctx['config']
-            # Ensure config is a numpy array (may be list from serialization)
             if not isinstance(config, np.ndarray):
                 config = np.array(config)
-            if len(config) != self.num_bits:
-                if len(config) < self.num_bits:
-                    config = np.pad(config, (0, self.num_bits - len(config)))
-                else:
-                    config = config[:self.num_bits]
             
-            config = config.astype(int)
-            embed = self.W_embed[config]  # (num_bits, d_model)
-            embed = embed + self.positional_encoding + self.W_pos_embed
+            # Handle size mismatch
+            if len(config) >= self.num_bits:
+                configs[i] = config[:self.num_bits]
+            else:
+                configs[i, :len(config)] = config
             
-            # Pool to single vector (mean pooling)
-            pooled = np.mean(embed, axis=0)  # (d_model,)
-            
-            # Weight by recency and quality
-            recency_weight = 1.0 - 0.5 * (len(self.context_memory) - ctx['timestamp']) / max(len(self.context_memory), 1)
-            quality_weight = 2.0 if ctx['improved'] else 1.0
-            
-            embeddings.append(pooled * recency_weight * quality_weight)
+            # Precompute weights
+            recency = 1.0 - 0.5 * (ctx_count - i) / ctx_count
+            quality = 2.0 if ctx['improved'] else 1.0
+            weights[i] = recency * quality
         
-        self.context_embeddings = np.stack(embeddings)  # (context_size, d_model)
+        # VECTORIZED: Batch embedding lookup and pooling
+        # Shape: (ctx_count, num_bits, d_model)
+        batch_embeds = self.W_embed[configs]
+        
+        # Add positional encoding (broadcasts over batch)
+        batch_embeds = batch_embeds + self.positional_encoding + self.W_pos_embed
+        
+        # Pool to single vector per context entry: (ctx_count, d_model)
+        pooled = np.mean(batch_embeds, axis=1)
+        
+        # Apply weights: (ctx_count, 1) * (ctx_count, d_model)
+        self.context_embeddings = pooled * weights[:, np.newaxis]
+        self._context_dirty = False
     
     def backward(self, target_flip_scores: np.ndarray = None, target_value: float = None,
                  flip_mask: np.ndarray = None) -> dict:
@@ -1506,6 +1540,7 @@ class BitTransformer:
                         new_diff: int, success: bool):
         """
         Learn from a single bit flip experience.
+        OPTIMIZED: Batches experiences and only updates periodically.
         
         Args:
             config: Configuration AFTER the flip
@@ -1514,35 +1549,69 @@ class BitTransformer:
             new_diff: Difference after flip
             success: Whether the flip improved things
         """
-        # Forward pass to get current predictions
-        result = self.forward(config)
+        # OPTIMIZATION: Batch flip experiences instead of learning on each one
+        if not hasattr(self, '_flip_buffer'):
+            self._flip_buffer = []
         
-        # Create target: boost score for successful flips, reduce for failures
-        target_scores = result['flip_scores'].copy()
+        # Store experience
+        self._flip_buffer.append({
+            'config': config.copy() if isinstance(config, np.ndarray) else np.array(config),
+            'bit_idx': bit_idx,
+            'old_diff': old_diff,
+            'new_diff': new_diff,
+            'success': success
+        })
         
-        improvement = old_diff - new_diff
-        if success and improvement > 0:
-            # Increase score for this bit
-            target_scores[bit_idx] += 0.5 * np.log1p(improvement)
-        elif not success:
-            # Decrease score for this bit
-            target_scores[bit_idx] -= 0.3
-        
-        # Create mask to focus on the flipped bit
-        mask = np.zeros(self.num_bits)
-        mask[bit_idx] = 1.0
-        # Also include nearby bits for context
-        for offset in [-2, -1, 1, 2]:
-            idx = bit_idx + offset
-            if 0 <= idx < self.num_bits:
-                mask[idx] = 0.5
-        
-        # Backward and update
-        grads = self.backward(target_flip_scores=target_scores, flip_mask=mask)
-        self.update_weights(grads)
-        
-        # Add to context memory
+        # Add to context memory (but don't recompute embeddings every time)
         self.add_to_context(config, new_diff, success)
+        
+        # OPTIMIZATION: Only learn every 10 flips, or immediately on success
+        should_learn = success or len(self._flip_buffer) >= 10
+        
+        if not should_learn:
+            return
+        
+        # Learn from the best experience in buffer (most improvement or most recent success)
+        best_exp = None
+        best_improvement = float('-inf')
+        
+        for exp in self._flip_buffer:
+            improvement = exp['old_diff'] - exp['new_diff']
+            if exp['success'] and improvement > best_improvement:
+                best_improvement = improvement
+                best_exp = exp
+        
+        # If no success, use most recent
+        if best_exp is None and self._flip_buffer:
+            best_exp = self._flip_buffer[-1]
+        
+        if best_exp:
+            # Forward pass
+            result = self.forward(best_exp['config'])
+            
+            # Create target
+            target_scores = result['flip_scores'].copy()
+            improvement = best_exp['old_diff'] - best_exp['new_diff']
+            
+            if best_exp['success'] and improvement > 0:
+                target_scores[best_exp['bit_idx']] += 0.5 * np.log1p(improvement)
+            else:
+                target_scores[best_exp['bit_idx']] -= 0.3
+            
+            # Create mask
+            mask = np.zeros(self.num_bits)
+            mask[best_exp['bit_idx']] = 1.0
+            for offset in [-2, -1, 1, 2]:
+                idx = best_exp['bit_idx'] + offset
+                if 0 <= idx < self.num_bits:
+                    mask[idx] = 0.5
+            
+            # Backward and update
+            grads = self.backward(target_flip_scores=target_scores, flip_mask=mask)
+            self.update_weights(grads)
+        
+        # Clear buffer
+        self._flip_buffer = []
     
     def learn_from_batch(self, experiences: list):
         """
@@ -1964,8 +2033,21 @@ class MLClauseLearner:
         print(f"\n[MLClauseLearner] 🚀 Initializing BUFFED BitTransformer attention module...")
         
         # Use stored settings if no settings passed directly
+        # Check multiple sources for model settings
         if model_settings is None:
             model_settings = self._transformer_model_settings
+        
+        # Also check if annealer has settings (GUI might have set them there)
+        if model_settings is None and hasattr(self, '_annealer_ref') and self._annealer_ref is not None:
+            model_settings = getattr(self._annealer_ref, 'transformer_model_settings', None)
+            if model_settings:
+                print(f"[MLClauseLearner] 📥 Retrieved model settings from annealer")
+        
+        # Debug: print what settings we're using
+        if model_settings:
+            print(f"[MLClauseLearner] 📋 Model settings: {model_settings}")
+        else:
+            print(f"[MLClauseLearner] ⚠️ No model settings provided, using auto-scale")
         
         # Check for GUI-provided model settings - THESE TAKE PRIORITY!
         if model_settings is not None and model_settings.get('preset') != 'Auto':
@@ -1980,6 +2062,25 @@ class MLClauseLearner:
                 num_experts = 2
                 num_kv_heads = 2
                 d_ff = 256
+            elif preset == 'Lean':
+                # 🎯 LEAN MODE: Optimized for factorization (not language)
+                # Smaller FFN since we only have binary inputs
+                print(f"[MLClauseLearner] 🎯 LEAN MODE: Optimized for factorization")
+                d_model = 256
+                num_layers = 4
+                num_heads = 8
+                num_experts = 4
+                num_kv_heads = 2
+                d_ff = 512  # Only 2x d_model (not 4x) - sufficient for bit patterns
+            elif preset == 'Micro':
+                # 🔬 MICRO MODE: Minimal footprint, fast iteration
+                print(f"[MLClauseLearner] 🔬 MICRO MODE: Minimal footprint")
+                d_model = 64
+                num_layers = 2
+                num_heads = 4
+                num_experts = 2
+                num_kv_heads = 2
+                d_ff = 128
             else:
                 d_model = model_settings.get('d_model', 256)
                 num_layers = model_settings.get('num_layers', 4)
@@ -1993,34 +2094,40 @@ class MLClauseLearner:
         else:
             # Auto-scale transformer dimensions based on problem size
             # Only used when no GUI settings or preset='Auto'
+            # NOTE: Using 2x FFN multiplier (not 4x) since factorization doesn't need LLM-scale capacity
             print(f"[MLClauseLearner] 📐 Auto-scaling for {self.num_bits} bits...")
             if self.num_bits > 2000:
-                # Large problems: substantial but not huge
-                d_model = 384
-                num_heads = 12
-                num_kv_heads = 4
-                num_layers = 6
-                d_ff = 1536
+                # Large problems: lean but capable
+                d_model = 256
+                num_heads = 8
+                num_kv_heads = 2
+                num_layers = 4
+                d_ff = 512  # 2x d_model (not 4x) - sufficient for bit patterns
                 num_experts = 4
             elif self.num_bits > 500:
                 # Medium problems
-                d_model = 512
-                num_heads = 16
-                num_kv_heads = 4
-                num_layers = 6
-                d_ff = 2048
+                d_model = 256
+                num_heads = 8
+                num_kv_heads = 2
+                num_layers = 4
+                d_ff = 512
                 num_experts = 4
             else:
-                # Small problems: full transformer
-                d_model = 512
-                num_heads = 16
-                num_kv_heads = 4
-                num_layers = 8
-                d_ff = 2048
-                num_experts = 8
+                # Small problems
+                d_model = 128
+                num_heads = 4
+                num_kv_heads = 2
+                num_layers = 3
+                d_ff = 256
+                num_experts = 4
         
         # Determine if we should auto-scale (only when no GUI settings provided)
+        # IMPORTANT: Never auto-scale if we have ANY model settings from GUI
         use_auto_scale = (model_settings is None)
+        
+        # Double-check: print what we're actually using
+        print(f"[MLClauseLearner] 🔧 Final config: d_model={d_model}, layers={num_layers}, heads={num_heads}, experts={num_experts}")
+        print(f"[MLClauseLearner] 🔧 BitTransformer auto_scale={use_auto_scale}")
         
         self.transformer = BitTransformer(
             num_bits=self.num_bits,
@@ -3735,6 +3842,7 @@ class IncrementalQuantumAnnealing:
         # NEW: ML-based clause learner (neural network) with TRAP AWARENESS
         self.ml_clause_learner = MLClauseLearner(self.num_qubits, hidden_size=128)
         self.ml_clause_learner.set_N(N)  # Enable sqrt(N) trap detection
+        self.ml_clause_learner._annealer_ref = self  # Reference back to annealer for settings
         print(f"[ML Learning] Neural clause learner initialized ({self.num_qubits} bits -> 2048 hidden)")
         print(f"[ML Learning] TRAP AWARENESS enabled: sqrt(N) ≈ {self.ml_clause_learner.sqrt_N}")
         
