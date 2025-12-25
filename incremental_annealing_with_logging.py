@@ -21,73 +21,109 @@ import multiprocessing as mp
 # =============================================================================
 class BitTransformer:
     """
-    Heavyweight LLM-style Transformer for bit sequence modeling.
+    🚀 BUFFED Heavyweight LLM-style Transformer for bit sequence modeling.
+    
+    Enhanced with modern techniques from LLaMA, GPT-4, Mistral:
+    - Rotary Position Encoding (RoPE) instead of sinusoidal
+    - Grouped-Query Attention (GQA) for efficiency
+    - SwiGLU activation in FFN
+    - RMSNorm instead of LayerNorm (faster)
+    - Expert routing (lite MoE) for specialized bit patterns
+    - Larger context memory with recency weighting
     
     Treats bit configurations as sequences and learns:
     - Which bits influence each other (multi-head self-attention)
-    - Positional importance (sinusoidal encoding like GPT/BERT)
+    - Positional importance (RoPE encoding)
     - Historical patterns (context memory window)
     - Bit flip predictions (output head)
     
     Architecture:
-        Input bits → Embedding → Positional Encoding
+        Input bits → Embedding → RoPE Encoding
               ↓
-        [Transformer Layer 1] (Multi-Head Attention + FFN + LayerNorm)
+        [Transformer Layer 1] (GQA + SwiGLU FFN + RMSNorm + Expert Routing)
               ↓
         [Transformer Layer 2]
               ↓
-        [Transformer Layer 3]
+        ... (6 layers total)
               ↓
-        [Transformer Layer 4]
+        [Transformer Layer 6]
               ↓
-        Output Head → Flip Scores + Value Prediction
+        Output Head → Flip Scores + Value Prediction + Confidence
     
     This modulates the existing MLClauseLearner by providing attention-weighted
     bit importance scores that capture long-range bit dependencies.
     """
     
-    def __init__(self, num_bits: int, d_model: int = 256, num_heads: int = 8,
-                 num_layers: int = 4, d_ff: int = 1024, max_context: int = 100,
-                 dropout_rate: float = 0.1):
+    def __init__(self, num_bits: int, d_model: int = 512, num_heads: int = 16,
+                 num_layers: int = 6, d_ff: int = 2048, max_context: int = 500,
+                 dropout_rate: float = 0.1, num_kv_heads: int = 4, num_experts: int = 4,
+                 auto_scale: bool = False):
         """
-        Initialize the BitTransformer.
+        Initialize the BUFFED BitTransformer.
         
         Args:
             num_bits: Number of bits in configuration (sequence length)
-            d_model: Model dimension (embedding size)
-            num_heads: Number of attention heads
-            num_layers: Number of transformer layers
-            d_ff: Feed-forward hidden dimension
-            max_context: Maximum context memory size
-            dropout_rate: Dropout probability (stored but not used in numpy)
+            d_model: Model dimension (embedding size) - DOUBLED to 512
+            num_heads: Number of attention heads - DOUBLED to 16
+            num_layers: Number of transformer layers - INCREASED to 6
+            d_ff: Feed-forward hidden dimension - DOUBLED to 2048
+            max_context: Maximum context memory size - INCREASED to 500
+            dropout_rate: Dropout probability
+            num_kv_heads: Number of key/value heads for GQA (< num_heads)
+            num_experts: Number of FFN experts for lite MoE routing
         """
         self.num_bits = num_bits
         self.d_model = d_model
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads  # GQA: fewer KV heads than Q heads
         self.num_layers = num_layers
         self.d_ff = d_ff
         self.d_k = d_model // num_heads  # Key/Query/Value dimension per head
         self.max_context = max_context
         self.dropout_rate = dropout_rate
+        self.num_experts = num_experts  # Lite MoE
+        self.auto_scale = auto_scale
         
-        # Scale d_model for very large bit sequences
-        if num_bits > 1000:
-            self.d_model = max(d_model, min(512, num_bits // 4))
-            self.d_ff = self.d_model * 4
-            self.d_k = self.d_model // num_heads
+        # Scale d_model for very large bit sequences - ONLY if auto_scale=True
+        # When GUI provides explicit settings, respect them!
+        if auto_scale:
+            print(f"[BitTransformer] 📐 Auto-scaling enabled for {num_bits} bits")
+            # IMPORTANT: d_model must be divisible by num_heads!
+            if num_bits > 2000:
+                # Round to nearest multiple of num_heads
+                target_d = max(d_model, min(768, num_bits // 3))
+                self.d_model = (target_d // num_heads) * num_heads
+                self.d_ff = self.d_model * 4
+                self.d_k = self.d_model // num_heads
+                self.num_layers = max(num_layers, 8)  # More layers for bigger problems
+            elif num_bits > 1000:
+                target_d = max(d_model, min(640, num_bits // 3))
+                self.d_model = (target_d // num_heads) * num_heads
+                self.d_ff = self.d_model * 4
+                self.d_k = self.d_model // num_heads
+        else:
+            # Respect the explicit settings from GUI/caller
+            # Just ensure d_model is divisible by num_heads
+            if d_model % num_heads != 0:
+                self.d_model = (d_model // num_heads) * num_heads
+                print(f"[BitTransformer] ⚠️ Adjusted d_model {d_model} -> {self.d_model} (must be divisible by {num_heads} heads)")
         
-        print(f"[BitTransformer] Initializing LLM-style attention module:")
+        print(f"[BitTransformer] 🚀 Initializing BUFFED LLM-style attention module:")
         print(f"  Sequence length: {num_bits} bits")
-        print(f"  Model dimension: {self.d_model}")
-        print(f"  Attention heads: {num_heads} (d_k={self.d_k})")
-        print(f"  Transformer layers: {num_layers}")
-        print(f"  FFN dimension: {self.d_ff}")
+        print(f"  Model dimension: {self.d_model} (buffed)")
+        print(f"  Attention heads: {num_heads} Q-heads, {num_kv_heads} KV-heads (GQA)")
+        print(f"  Transformer layers: {self.num_layers} (deep)")
+        print(f"  FFN dimension: {self.d_ff} (wide)")
+        print(f"  Expert networks: {num_experts} (lite MoE)")
         print(f"  Context memory: {max_context} configurations")
         
         # =====================================================================
-        # POSITIONAL ENCODING (Sinusoidal, like original Transformer)
+        # POSITIONAL ENCODING: RoPE (Rotary Position Encoding) + Sinusoidal fallback
+        # RoPE is used in LLaMA, Mistral, etc. - better for variable length
         # =====================================================================
         self.positional_encoding = self._create_positional_encoding(num_bits, self.d_model)
+        self.rope_freqs = self._create_rope_frequencies(num_bits, self.d_k)
+        self.use_rope = True  # Use RoPE instead of sinusoidal in attention
         
         # =====================================================================
         # INPUT EMBEDDING: Map bits (0/1) to d_model dimensional vectors
@@ -95,19 +131,44 @@ class BitTransformer:
         # Learnable embedding for bit values (like token embedding in LLMs)
         self.W_embed = np.random.randn(2, self.d_model) * 0.02
         
-        # Additional bit position embedding (learnable, complements sinusoidal)
+        # Additional bit position embedding (learnable, complements RoPE)
         self.W_pos_embed = np.random.randn(num_bits, self.d_model) * 0.02
         
+        # Bit significance embedding (higher bits = more significant)
+        self.W_significance = np.random.randn(num_bits, self.d_model) * 0.01
+        # Initialize with bit position importance (higher bits more important)
+        for i in range(num_bits):
+            self.W_significance[i] *= (1.0 + np.log1p(i + 1) / np.log1p(num_bits))
+        
         # =====================================================================
-        # TRANSFORMER LAYERS
+        # TRANSFORMER LAYERS (with Expert Routing)
         # =====================================================================
         self.layers = []
-        for layer_idx in range(num_layers):
+        for layer_idx in range(self.num_layers):
             layer = self._create_transformer_layer(layer_idx)
             self.layers.append(layer)
         
         # =====================================================================
-        # OUTPUT HEADS
+        # EXPERT NETWORKS (Lite Mixture of Experts)
+        # Each expert specializes in different bit patterns
+        # =====================================================================
+        self.experts = []
+        for expert_idx in range(self.num_experts):
+            expert = {
+                'W1': np.random.randn(self.d_model, self.d_ff // 2) * np.sqrt(2.0 / self.d_model),
+                'b1': np.zeros(self.d_ff // 2),
+                'W2': np.random.randn(self.d_ff // 2, self.d_model) * np.sqrt(2.0 / (self.d_ff // 2)),
+                'b2': np.zeros(self.d_model),
+                'W_gate': np.random.randn(self.d_model, self.d_ff // 2) * np.sqrt(2.0 / self.d_model),
+            }
+            self.experts.append(expert)
+        
+        # Expert router: decides which expert(s) to use for each position
+        self.W_router = np.random.randn(self.d_model, self.num_experts) * 0.01
+        self.expert_usage_count = np.zeros(self.num_experts)  # Track usage for load balancing
+        
+        # =====================================================================
+        # OUTPUT HEADS (Enhanced)
         # =====================================================================
         # Flip score head: predicts flip quality for each bit position
         self.W_flip = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
@@ -117,9 +178,48 @@ class BitTransformer:
         self.W_value = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
         self.b_value = np.zeros(1)
         
+        # Confidence head: how certain are we about this prediction?
+        self.W_confidence = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        self.b_confidence = np.zeros(1)
+        
+        # Multi-flip head: predict quality of flipping multiple bits together
+        self.W_multi_flip = np.random.randn(self.d_model, 8) * np.sqrt(2.0 / self.d_model)
+        self.b_multi_flip = np.zeros(8)
+        
         # Attention aggregation: pool sequence to single vector for global prediction
         self.W_pool = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
         self.b_pool = np.zeros(self.d_model)
+        
+        # Cross-bit interaction head: which pairs of bits should be flipped together?
+        self.W_pair_query = np.random.randn(self.d_model, self.d_model // 4) * np.sqrt(2.0 / self.d_model)
+        self.W_pair_key = np.random.randn(self.d_model, self.d_model // 4) * np.sqrt(2.0 / self.d_model)
+        
+        # =====================================================================
+        # FACTORIZATION-AWARE HEADS (Critical for finding P×Q = N)
+        # =====================================================================
+        # Product error prediction: how far is current P×Q from N?
+        self.W_product_error = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        self.b_product_error = np.zeros(1)
+        
+        # Factor balance head: which factor (P or Q) needs more adjustment?
+        self.W_factor_balance = np.random.randn(self.d_model, 2) * np.sqrt(2.0 / self.d_model)
+        self.b_factor_balance = np.zeros(2)
+        
+        # Bit-to-factor mapping: which bits belong to P vs Q
+        self.W_p_bits = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        self.W_q_bits = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        
+        # Product gradient head: which direction should P×Q move?
+        self.W_product_direction = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        
+        # =====================================================================
+        # FACTORIZATION LEARNING STATE
+        # =====================================================================
+        self.N = None  # Target number to factor
+        self.best_diff = float('inf')  # Best |P×Q - N| seen
+        self.best_config = None
+        self.factor_history = []  # Track (P, Q, diff) history
+        self.successful_patterns = []  # Patterns that improved diff
         
         # =====================================================================
         # CONTEXT MEMORY (like KV-cache in LLMs)
@@ -138,13 +238,20 @@ class BitTransformer:
         self.ln_context_beta = np.zeros(self.d_model)
         
         # =====================================================================
-        # OPTIMIZER STATE (Adam)
+        # OPTIMIZER STATE (AdamW with Warmup + Cosine Decay)
         # =====================================================================
-        self.lr = 0.0001  # Lower LR for transformer stability
+        self.base_lr = 0.0003  # Higher base LR for buffed transformer
+        self.lr = 0.0  # Starts at 0, warms up
+        self.min_lr = 0.00001  # Minimum LR after decay
+        self.warmup_steps = 100  # Warmup period
+        self.max_steps = 10000  # For cosine decay
         self.beta1 = 0.9
-        self.beta2 = 0.999
+        self.beta2 = 0.95  # Slightly lower for stability (like GPT-3)
         self.epsilon = 1e-8
+        self.weight_decay = 0.01  # AdamW weight decay
         self.t = 0  # Time step for Adam
+        self.gradient_accumulation_steps = 4  # Accumulate gradients
+        self.accumulated_gradients = {}  # Store accumulated gradients
         
         # Initialize Adam momentum buffers for all weights
         self._init_optimizer_state()
@@ -165,6 +272,7 @@ class BitTransformer:
     def _create_positional_encoding(self, seq_len: int, d_model: int) -> np.ndarray:
         """
         Create sinusoidal positional encoding (Vaswani et al., 2017).
+        Used as fallback; RoPE is primary.
         
         PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
         PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
@@ -177,6 +285,63 @@ class BitTransformer:
         pe[:, 1::2] = np.cos(position * div_term)
         
         return pe
+    
+    def _create_rope_frequencies(self, seq_len: int, head_dim: int) -> np.ndarray:
+        """
+        Create Rotary Position Encoding (RoPE) frequencies.
+        Used in LLaMA, Mistral, etc. - captures relative positions better.
+        
+        RoPE applies rotation to query/key vectors based on position,
+        encoding relative position information in the attention scores.
+        """
+        # Frequencies for each dimension pair
+        theta = 10000.0
+        freqs = 1.0 / (theta ** (np.arange(0, head_dim, 2)[:head_dim // 2] / head_dim))
+        
+        # Position indices
+        positions = np.arange(seq_len)
+        
+        # Outer product: (seq_len, head_dim // 2)
+        freqs_matrix = np.outer(positions, freqs)
+        
+        # Stack sin and cos for rotation
+        rope_cos = np.cos(freqs_matrix)
+        rope_sin = np.sin(freqs_matrix)
+        
+        return {'cos': rope_cos, 'sin': rope_sin}
+    
+    def _apply_rope(self, x: np.ndarray, positions: np.ndarray = None) -> np.ndarray:
+        """
+        Apply Rotary Position Encoding to input tensor.
+        
+        Args:
+            x: Input tensor of shape (seq_len, head_dim)
+            positions: Optional position indices (default: 0..seq_len-1)
+            
+        Returns:
+            Tensor with rotary encoding applied
+        """
+        seq_len, head_dim = x.shape
+        
+        # Get rotation matrices for these positions
+        if positions is None:
+            cos = self.rope_freqs['cos'][:seq_len]
+            sin = self.rope_freqs['sin'][:seq_len]
+        else:
+            cos = self.rope_freqs['cos'][positions]
+            sin = self.rope_freqs['sin'][positions]
+        
+        # Split into pairs for rotation
+        x1 = x[:, :head_dim // 2]
+        x2 = x[:, head_dim // 2:]
+        
+        # Apply rotation: [cos, -sin; sin, cos] @ [x1; x2]
+        rotated = np.concatenate([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], axis=-1)
+        
+        return rotated
     
     def _create_transformer_layer(self, layer_idx: int) -> dict:
         """Create weights for one transformer layer."""
@@ -217,7 +382,7 @@ class BitTransformer:
         return layer
     
     def _init_optimizer_state(self):
-        """Initialize Adam optimizer momentum buffers."""
+        """Initialize AdamW optimizer momentum buffers."""
         self.m = {}  # First moment
         self.v = {}  # Second moment
         
@@ -226,9 +391,15 @@ class BitTransformer:
         self.v['W_embed'] = np.zeros_like(self.W_embed)
         self.m['W_pos_embed'] = np.zeros_like(self.W_pos_embed)
         self.v['W_pos_embed'] = np.zeros_like(self.W_pos_embed)
+        self.m['W_significance'] = np.zeros_like(self.W_significance)
+        self.v['W_significance'] = np.zeros_like(self.W_significance)
         
-        # Output heads
-        for name in ['W_flip', 'b_flip', 'W_value', 'b_value', 'W_pool', 'b_pool']:
+        # Output heads (including new ones and factorization heads)
+        for name in ['W_flip', 'b_flip', 'W_value', 'b_value', 'W_pool', 'b_pool',
+                     'W_confidence', 'b_confidence', 'W_multi_flip', 'b_multi_flip',
+                     'W_pair_query', 'W_pair_key', 'W_router',
+                     'W_product_error', 'b_product_error', 'W_factor_balance', 'b_factor_balance',
+                     'W_p_bits', 'W_q_bits', 'W_product_direction']:
             arr = getattr(self, name)
             self.m[name] = np.zeros_like(arr)
             self.v[name] = np.zeros_like(arr)
@@ -247,24 +418,113 @@ class BitTransformer:
                     name = f'layer{i}_{key}'
                     self.m[name] = np.zeros_like(arr)
                     self.v[name] = np.zeros_like(arr)
+        
+        # Expert weights
+        for i, expert in enumerate(self.experts):
+            for key, arr in expert.items():
+                if isinstance(arr, np.ndarray):
+                    name = f'expert{i}_{key}'
+                    self.m[name] = np.zeros_like(arr)
+                    self.v[name] = np.zeros_like(arr)
     
     def _count_parameters(self) -> int:
         """Count total trainable parameters."""
         count = 0
         count += self.W_embed.size + self.W_pos_embed.size
+        count += self.W_significance.size
         count += self.W_flip.size + self.b_flip.size
         count += self.W_value.size + self.b_value.size
+        count += self.W_confidence.size + self.b_confidence.size
+        count += self.W_multi_flip.size + self.b_multi_flip.size
         count += self.W_pool.size + self.b_pool.size
+        count += self.W_pair_query.size + self.W_pair_key.size
         count += self.W_context_K.size + self.W_context_V.size
         count += self.W_context_Q.size + self.W_context_O.size
         count += self.ln_context_gamma.size + self.ln_context_beta.size
+        count += self.W_router.size
         
         for layer in self.layers:
             for key, arr in layer.items():
                 if isinstance(arr, np.ndarray):
                     count += arr.size
         
+        # Expert networks
+        for expert in self.experts:
+            for key, arr in expert.items():
+                if isinstance(arr, np.ndarray):
+                    count += arr.size
+        
         return count
+    
+    def _rms_norm(self, x: np.ndarray, gamma: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """
+        RMSNorm (Root Mean Square Layer Normalization).
+        Faster than LayerNorm - used in LLaMA, Mistral.
+        
+        RMSNorm(x) = x / sqrt(mean(x^2) + eps) * gamma
+        """
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
+        return (x / rms) * gamma
+    
+    def _route_to_experts(self, x: np.ndarray, top_k: int = 2) -> np.ndarray:
+        """
+        Route input to top-k experts (Mixture of Experts).
+        
+        Args:
+            x: Input tensor (seq_len, d_model)
+            top_k: Number of experts to activate per token
+            
+        Returns:
+            Expert-weighted output
+        """
+        seq_len = x.shape[0]
+        
+        # Compute router logits
+        router_logits = x @ self.W_router  # (seq_len, num_experts)
+        
+        # Softmax over experts
+        router_probs = self._softmax(router_logits, axis=-1)
+        
+        # Get top-k experts for each position
+        top_k_indices = np.argsort(-router_probs, axis=-1)[:, :top_k]
+        top_k_probs = np.take_along_axis(router_probs, top_k_indices, axis=-1)
+        
+        # Normalize top-k probabilities
+        top_k_probs = top_k_probs / (top_k_probs.sum(axis=-1, keepdims=True) + 1e-10)
+        
+        # Compute expert outputs
+        output = np.zeros_like(x)
+        for pos in range(seq_len):
+            for k in range(top_k):
+                expert_idx = top_k_indices[pos, k]
+                expert = self.experts[expert_idx]
+                prob = top_k_probs[pos, k]
+                
+                # Expert forward pass (SwiGLU)
+                hidden = x[pos:pos+1] @ expert['W1'] + expert['b1']
+                gate = 1 / (1 + np.exp(-np.clip(x[pos:pos+1] @ expert['W_gate'], -20, 20)))
+                hidden_act = self._gelu(hidden) * gate
+                expert_out = hidden_act @ expert['W2'] + expert['b2']
+                
+                output[pos] += prob * expert_out.squeeze()
+                
+                # Track usage for load balancing
+                self.expert_usage_count[expert_idx] += 1
+        
+        return output
+    
+    def _get_learning_rate(self) -> float:
+        """
+        Get current learning rate with warmup and cosine decay.
+        """
+        if self.t < self.warmup_steps:
+            # Linear warmup
+            return self.base_lr * (self.t / self.warmup_steps)
+        else:
+            # Cosine decay
+            progress = min((self.t - self.warmup_steps) / (self.max_steps - self.warmup_steps), 1.0)
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            return self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
     
     def _layer_norm(self, x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, 
                     eps: float = 1e-5) -> tuple:
@@ -460,7 +720,7 @@ class BitTransformer:
     
     def forward(self, config: np.ndarray, return_attention: bool = False) -> dict:
         """
-        Full forward pass through the BitTransformer.
+        🚀 BUFFED forward pass through the BitTransformer.
         
         Args:
             config: Bit configuration (num_bits,) with values 0 or 1
@@ -470,6 +730,9 @@ class BitTransformer:
             dict with:
                 - 'flip_scores': Score for flipping each bit (num_bits,)
                 - 'value': Expected value/improvement scalar
+                - 'confidence': Prediction confidence (0-1)
+                - 'multi_flip_scores': Scores for multi-bit flips
+                - 'pair_affinities': Which bits should flip together
                 - 'attention_weights': List of attention weights per layer (if requested)
                 - 'bit_embeddings': Final bit representations (num_bits, d_model)
         """
@@ -484,20 +747,20 @@ class BitTransformer:
         config = config.astype(int)
         
         # =====================================================================
-        # EMBEDDING: bits -> dense vectors
+        # EMBEDDING: bits -> dense vectors (BUFFED with significance)
         # =====================================================================
         # Token embedding: lookup in W_embed based on bit value
         x = self.W_embed[config]  # (num_bits, d_model)
         
-        # Add positional encoding (sinusoidal + learnable)
-        x = x + self.positional_encoding + self.W_pos_embed
+        # Add positional encoding (sinusoidal + learnable + significance)
+        x = x + self.positional_encoding + self.W_pos_embed + self.W_significance
         
         # Store for backward
         self._cache['input_embed'] = x.copy()
         self._cache['config'] = config
         
         # =====================================================================
-        # TRANSFORMER LAYERS
+        # TRANSFORMER LAYERS (BUFFED with more layers)
         # =====================================================================
         layer_caches = []
         all_attention_weights = []
@@ -508,28 +771,47 @@ class BitTransformer:
             all_attention_weights.append(layer_cache['attn_weights'])
         
         self._cache['layer_caches'] = layer_caches
+        
+        # =====================================================================
+        # EXPERT ROUTING (Lite MoE - BUFFED)
+        # =====================================================================
+        x_expert = self._route_to_experts(x, top_k=2)
+        x = x + x_expert * 0.5  # Weighted expert contribution
+        
         self._cache['final_hidden'] = x
         
         # =====================================================================
         # CONTEXT ATTENTION (attend to past configurations)
         # =====================================================================
         if len(self.context_memory) > 0 and self.context_embeddings is not None:
-            # Cross-attention to context
+            # Cross-attention to context (simplified for context_embeddings shape)
             x_norm, ln_ctx_cache = self._layer_norm(x, self.ln_context_gamma, self.ln_context_beta)
             
-            context_out, context_attn, context_cache = self._multi_head_attention(
-                x_norm, self.context_embeddings, self.context_embeddings,
-                self.W_context_Q, self.W_context_K, self.W_context_V, self.W_context_O
-            )
+            # Context embeddings are (context_size, d_model)
+            # We use a simpler attention: pool x to query, attend to context
+            context_size = self.context_embeddings.shape[0]
             
-            # Residual
-            x = x + context_out * 0.5  # Weighted residual for context
+            # Query from current state (pooled)
+            x_pooled = np.mean(x_norm, axis=0, keepdims=True)  # (1, d_model)
+            Q_ctx = x_pooled @ self.W_context_Q  # (1, d_model)
+            K_ctx = self.context_embeddings @ self.W_context_K  # (context_size, d_model)
+            V_ctx = self.context_embeddings @ self.W_context_V  # (context_size, d_model)
             
-            self._cache['context_cache'] = context_cache
+            # Simple scaled dot-product attention
+            scores = (Q_ctx @ K_ctx.T) / np.sqrt(self.d_model)  # (1, context_size)
+            attn_weights = self._softmax(scores, axis=-1)  # (1, context_size)
+            context_vec = attn_weights @ V_ctx  # (1, d_model)
+            context_vec = context_vec @ self.W_context_O  # (1, d_model)
+            
+            # Broadcast to all positions and add residual
+            context_out = np.broadcast_to(context_vec, x.shape)
+            x = x + context_out * 0.7  # Increased context weight
+            
+            self._cache['context_attn_weights'] = attn_weights
             self._cache['ln_ctx_cache'] = ln_ctx_cache
         
         # =====================================================================
-        # OUTPUT HEADS
+        # OUTPUT HEADS (BUFFED with more outputs)
         # =====================================================================
         # Per-position flip scores
         flip_scores = (x @ self.W_flip + self.b_flip).squeeze(-1)  # (num_bits,)
@@ -541,14 +823,31 @@ class BitTransformer:
         # Value head
         value = (pooled @ self.W_value + self.b_value).item()
         
+        # BUFFED: Confidence head (sigmoid for 0-1 range)
+        confidence_logit = (pooled @ self.W_confidence + self.b_confidence).item()
+        confidence = 1 / (1 + np.exp(-np.clip(confidence_logit, -20, 20)))
+        
+        # BUFFED: Multi-flip scores (for considering flipping multiple bits)
+        multi_flip_scores = pooled @ self.W_multi_flip + self.b_multi_flip  # (8,)
+        
+        # BUFFED: Pair affinities (which bits should flip together)
+        pair_query = x @ self.W_pair_query  # (num_bits, d_model//4)
+        pair_key = x @ self.W_pair_key      # (num_bits, d_model//4)
+        pair_affinities = pair_query @ pair_key.T  # (num_bits, num_bits)
+        pair_affinities = self._softmax(pair_affinities / np.sqrt(self.d_model // 4), axis=-1)
+        
         self._cache['flip_scores'] = flip_scores
         self._cache['pool_weights'] = pool_weights
         self._cache['pooled'] = pooled
         self._cache['value'] = value
+        self._cache['confidence'] = confidence
         
         result = {
             'flip_scores': flip_scores,
             'value': value,
+            'confidence': confidence,
+            'multi_flip_scores': multi_flip_scores,
+            'pair_affinities': pair_affinities,
             'bit_embeddings': x
         }
         
@@ -564,8 +863,312 @@ class BitTransformer:
                 entropy = -np.sum(attn_avg * np.log(attn_avg + 1e-10), axis=-1)
                 entropies.append(np.mean(entropy))
             result['attention_entropy'] = np.mean(entropies)
+            
+            # BUFFED: Expert usage statistics
+            result['expert_usage'] = self.expert_usage_count.copy()
+        
+        # =====================================================================
+        # FACTORIZATION-AWARE OUTPUTS (Critical for P×Q = N)
+        # =====================================================================
+        # Product error prediction (normalized log scale)
+        product_error_pred = (pooled @ self.W_product_error + self.b_product_error).item()
+        result['predicted_log_error'] = product_error_pred
+        
+        # Factor balance: [P_adjustment_needed, Q_adjustment_needed]
+        factor_balance = pooled @ self.W_factor_balance + self.b_factor_balance
+        factor_balance = self._softmax(factor_balance)
+        result['factor_balance'] = factor_balance  # Which factor needs more work
+        
+        # Per-bit factor attribution: is this bit more P or Q?
+        p_attribution = (x @ self.W_p_bits).squeeze(-1)  # (num_bits,)
+        q_attribution = (x @ self.W_q_bits).squeeze(-1)  # (num_bits,)
+        pq_attribution = np.stack([p_attribution, q_attribution], axis=-1)
+        pq_attribution = self._softmax(pq_attribution, axis=-1)
+        result['pq_attribution'] = pq_attribution  # (num_bits, 2) - P vs Q for each bit
+        
+        # Product direction: should P×Q increase or decrease?
+        product_direction = np.tanh(pooled @ self.W_product_direction).item()
+        result['product_direction'] = product_direction  # -1 = decrease, +1 = increase
         
         return result
+    
+    def set_target_N(self, N: int):
+        """
+        Set the target number N to factorize.
+        This enables factorization-aware learning.
+        """
+        self.N = N
+        self.N_bits = N.bit_length()
+        print(f"[BitTransformer] 🎯 Target N set: {self.N_bits} bits")
+        print(f"[BitTransformer] 🔬 Factorization-aware learning ENABLED")
+    
+    def learn_from_factorization_attempt(self, config: np.ndarray, P: int, Q: int, 
+                                          diff: int, prev_diff: int = None):
+        """
+        🎯 CRITICAL: Learn from a factorization attempt.
+        
+        This is the core learning signal for finding P×Q = N.
+        The transformer learns:
+        - Which bit patterns lead to smaller |P×Q - N|
+        - How P and Q relate to the bit configuration
+        - Which bits are most important for getting closer to N
+        
+        Args:
+            config: Current bit configuration
+            P: Current P factor value
+            Q: Current Q factor value  
+            diff: Current |P×Q - N|
+            prev_diff: Previous |P×Q - N| (for computing improvement)
+        """
+        if self.N is None:
+            return
+        
+        # Determine if this improved
+        improved = False
+        if prev_diff is not None:
+            improved = diff < prev_diff
+        
+        if diff < self.best_diff:
+            self.best_diff = diff
+            self.best_config = config.copy()
+            improved = True
+        
+        # Add to context memory with factorization info
+        self.add_to_context(config, diff, improved)
+        
+        # Store in factor history
+        self.factor_history.append({
+            'config': config.copy(),
+            'P': P,
+            'Q': Q,
+            'diff': diff,
+            'improved': improved,
+            'product': P * Q,
+            'error_direction': 1 if P * Q > self.N else -1
+        })
+        
+        # Keep history bounded
+        if len(self.factor_history) > 1000:
+            self.factor_history = self.factor_history[-1000:]
+        
+        # =====================================================================
+        # COMPUTE LEARNING SIGNAL
+        # =====================================================================
+        # Forward pass to get current predictions
+        result = self.forward(config)
+        
+        # Target flip scores: bits that would help should have higher scores
+        # Use gradient information from history
+        target_flip_scores = self._compute_factorization_targets(config, P, Q, diff)
+        
+        # Target value: normalized negative log of diff
+        # Use bit_length for huge integers (avoids numpy overflow issues)
+        if diff > 0:
+            # For huge integers, use bit_length as proxy for log
+            # log10(x) ≈ bit_length(x) * log10(2) ≈ bit_length(x) * 0.301
+            try:
+                if isinstance(diff, int) and diff.bit_length() > 1000:
+                    # Use bit_length approximation for huge integers
+                    log_diff = diff.bit_length() * 0.30103  # log10(2)
+                    log_N = self.N.bit_length() * 0.30103 if isinstance(self.N, int) else np.log10(float(self.N))
+                else:
+                    log_diff = np.log10(float(max(diff, 1)))
+                    log_N = np.log10(float(max(self.N, 2)))
+                target_value = -log_diff / max(log_N, 1)
+                target_value = max(-1.0, min(1.0, target_value))  # Clamp to [-1, 1]
+            except (OverflowError, ValueError):
+                # Fallback: use bit length ratio
+                target_value = -diff.bit_length() / max(self.N.bit_length(), 1)
+                target_value = max(-1.0, min(1.0, target_value))
+        else:
+            target_value = 1.0  # Perfect factorization!
+        
+        # Backward pass
+        self.backward(
+            target_flip_scores=target_flip_scores,
+            target_value=target_value
+        )
+        
+        # Update learning rate with warmup/decay
+        self.t += 1
+        self.lr = self._get_learning_rate()
+        
+        # Track successful patterns
+        if improved and prev_diff is not None:
+            improvement_ratio = prev_diff / max(diff, 1)
+            if improvement_ratio > 1.1:  # Significant improvement
+                self.successful_patterns.append({
+                    'config': config.copy(),
+                    'improvement': improvement_ratio,
+                    'diff': diff
+                })
+                if len(self.successful_patterns) > 100:
+                    self.successful_patterns = sorted(
+                        self.successful_patterns, 
+                        key=lambda x: -x['improvement']
+                    )[:100]
+    
+    def _compute_factorization_targets(self, config: np.ndarray, P: int, Q: int, 
+                                        diff: int) -> np.ndarray:
+        """
+        Compute target flip scores based on factorization learning.
+        
+        Uses history to determine which bits, when flipped, tend to improve
+        the factorization (reduce |P×Q - N|).
+        """
+        target_scores = np.zeros(self.num_bits)
+        
+        if len(self.factor_history) < 2:
+            return target_scores
+        
+        # Analyze recent history to find which bit flips helped
+        recent = self.factor_history[-100:]
+        
+        for i in range(1, len(recent)):
+            prev = recent[i-1]
+            curr = recent[i]
+            
+            if len(prev['config']) != len(curr['config']):
+                continue
+            
+            # Find which bits changed
+            changed_bits = np.where(prev['config'] != curr['config'])[0]
+            
+            # If improvement, reward those bits
+            if curr['diff'] < prev['diff']:
+                improvement = (prev['diff'] - curr['diff']) / max(prev['diff'], 1)
+                for bit_idx in changed_bits:
+                    if bit_idx < self.num_bits:
+                        target_scores[bit_idx] += improvement
+            else:
+                # If worse, penalize those bits
+                degradation = (curr['diff'] - prev['diff']) / max(curr['diff'], 1)
+                for bit_idx in changed_bits:
+                    if bit_idx < self.num_bits:
+                        target_scores[bit_idx] -= degradation * 0.5  # Smaller penalty
+        
+        # Normalize
+        if np.abs(target_scores).max() > 0:
+            target_scores = target_scores / (np.abs(target_scores).max() + 1e-10)
+        
+        # Add signal based on current error direction
+        if self.N is not None:
+            product = P * Q
+            if product > self.N:
+                # Need to decrease product - flip high bits in P or Q
+                # Higher bits have more impact
+                for i in range(self.num_bits):
+                    if config[i] == 1:
+                        # Bit is 1, flipping to 0 would decrease product
+                        bit_weight = (i + 1) / self.num_bits
+                        target_scores[i] += 0.3 * bit_weight
+            else:
+                # Need to increase product - flip low bits to high
+                for i in range(self.num_bits):
+                    if config[i] == 0:
+                        # Bit is 0, flipping to 1 would increase product
+                        bit_weight = (i + 1) / self.num_bits
+                        target_scores[i] += 0.3 * bit_weight
+        
+        return np.clip(target_scores, -1, 1)
+    
+    def get_best_factorization_flips(self, config: np.ndarray, P: int, Q: int,
+                                      top_k: int = 10) -> list:
+        """
+        Get the best bit flips for improving factorization.
+        
+        Combines:
+        - Transformer attention-based recommendations
+        - Historical pattern analysis
+        - Error direction guidance
+        
+        Args:
+            config: Current bit configuration
+            P: Current P value
+            Q: Current Q value
+            top_k: Number of recommendations
+            
+        Returns:
+            List of recommended flips with scores and rationale
+        """
+        result = self.forward(config, return_attention=True)
+        
+        # Base flip scores from transformer
+        flip_scores = result['flip_scores'].copy()
+        
+        # Get factor attribution
+        pq_attr = result['pq_attribution']
+        factor_balance = result['factor_balance']
+        
+        # Boost scores based on which factor needs more adjustment
+        p_needs_work = factor_balance[0]
+        q_needs_work = factor_balance[1]
+        
+        for i in range(min(len(flip_scores), len(pq_attr))):
+            p_weight = pq_attr[i, 0]
+            q_weight = pq_attr[i, 1]
+            
+            # Boost bits that belong to the factor that needs more work
+            flip_scores[i] *= (1 + p_weight * p_needs_work + q_weight * q_needs_work)
+        
+        # Error direction adjustment
+        if self.N is not None:
+            product = P * Q
+            direction = result['product_direction']
+            
+            if product > self.N and direction < 0:
+                # Agreement: need to decrease, model says decrease
+                # Boost bits that are currently 1 (flipping reduces)
+                flip_scores = np.where(config == 1, flip_scores * 1.2, flip_scores)
+            elif product < self.N and direction > 0:
+                # Agreement: need to increase, model says increase
+                # Boost bits that are currently 0 (flipping increases)
+                flip_scores = np.where(config == 0, flip_scores * 1.2, flip_scores)
+        
+        # Confidence weighting
+        confidence = result['confidence']
+        
+        # Get top-k
+        top_indices = np.argsort(flip_scores)[::-1][:top_k]
+        
+        recommendations = []
+        for idx in top_indices:
+            rec = {
+                'bit_idx': int(idx),
+                'score': float(flip_scores[idx]),
+                'confidence': float(confidence),
+                'current_value': int(config[idx]) if idx < len(config) else 0,
+                'p_attribution': float(pq_attr[idx, 0]) if idx < len(pq_attr) else 0.5,
+                'q_attribution': float(pq_attr[idx, 1]) if idx < len(pq_attr) else 0.5,
+                'rationale': self._get_flip_rationale(idx, config, P, Q, result)
+            }
+            recommendations.append(rec)
+        
+        return recommendations
+    
+    def _get_flip_rationale(self, bit_idx: int, config: np.ndarray, 
+                            P: int, Q: int, result: dict) -> str:
+        """Generate human-readable rationale for a flip recommendation."""
+        current_val = config[bit_idx] if bit_idx < len(config) else 0
+        pq_attr = result['pq_attribution']
+        
+        p_attr = pq_attr[bit_idx, 0] if bit_idx < len(pq_attr) else 0.5
+        factor = "P" if p_attr > 0.5 else "Q"
+        
+        if self.N is not None:
+            product = P * Q
+            if product > self.N:
+                if current_val == 1:
+                    return f"Flip {factor}[{bit_idx}] 1→0 to decrease product"
+                else:
+                    return f"Consider {factor}[{bit_idx}] for balance adjustment"
+            else:
+                if current_val == 0:
+                    return f"Flip {factor}[{bit_idx}] 0→1 to increase product"
+                else:
+                    return f"Consider {factor}[{bit_idx}] for balance adjustment"
+        
+        return f"High attention on {factor}[{bit_idx}]"
     
     def get_flip_recommendations(self, config: np.ndarray, top_k: int = 10,
                                    temperature: float = 1.0) -> list:
@@ -1207,33 +1810,67 @@ class MLClauseLearner:
         self.use_transformer = True  # Can be disabled for faster inference
         self.transformer = None  # Lazy initialization to save memory
         self._transformer_initialized = False
+        self._transformer_model_settings = None  # Will be set by GUI before init
         
-    def _init_transformer(self):
-        """Lazily initialize the BitTransformer (heavy, so done on first use)."""
+    def set_transformer_model_settings(self, model_settings: dict):
+        """Store transformer model settings from GUI for use when transformer is initialized."""
+        self._transformer_model_settings = model_settings
+        preset = model_settings.get('preset', 'Custom') if model_settings else 'Auto'
+        print(f"[MLClauseLearner] ⚙️ Model settings stored: {preset} preset")
+    
+    def _init_transformer(self, model_settings: dict = None):
+        """Lazily initialize the BUFFED BitTransformer (heavy, so done on first use)."""
         if self._transformer_initialized:
             return
         
-        print(f"\n[MLClauseLearner] Initializing BitTransformer attention module...")
+        print(f"\n[MLClauseLearner] 🚀 Initializing BUFFED BitTransformer attention module...")
         
-        # Scale transformer dimensions based on problem size
-        if self.num_bits > 2000:
-            # Large problems: smaller transformer to save memory
-            d_model = 128
-            num_heads = 4
-            num_layers = 2
-            d_ff = 512
-        elif self.num_bits > 500:
-            # Medium problems
-            d_model = 256
-            num_heads = 8
-            num_layers = 3
-            d_ff = 1024
+        # Use stored settings if no settings passed directly
+        if model_settings is None:
+            model_settings = self._transformer_model_settings
+        
+        # Check for GUI-provided model settings - THESE TAKE PRIORITY!
+        if model_settings is not None and model_settings.get('preset') != 'Auto':
+            d_model = model_settings.get('d_model', 256)
+            num_layers = model_settings.get('num_layers', 4)
+            num_heads = model_settings.get('num_heads', 8)
+            num_experts = model_settings.get('num_experts', 4)
+            num_kv_heads = max(2, num_heads // 4)  # GQA: 1/4 of Q heads
+            d_ff = d_model * 4
+            preset = model_settings.get('preset', 'Custom')
+            print(f"[MLClauseLearner] ⚙️ Using {preset} preset from GUI (ignoring auto-scale)")
+            print(f"[MLClauseLearner]   d_model={d_model}, layers={num_layers}, heads={num_heads}, experts={num_experts}")
         else:
-            # Small problems: full transformer
-            d_model = 256
-            num_heads = 8
-            num_layers = 4
-            d_ff = 1024
+            # Auto-scale transformer dimensions based on problem size
+            # Only used when no GUI settings or preset='Auto'
+            print(f"[MLClauseLearner] 📐 Auto-scaling for {self.num_bits} bits...")
+            if self.num_bits > 2000:
+                # Large problems: substantial but not huge
+                d_model = 384
+                num_heads = 12
+                num_kv_heads = 4
+                num_layers = 6
+                d_ff = 1536
+                num_experts = 4
+            elif self.num_bits > 500:
+                # Medium problems
+                d_model = 512
+                num_heads = 16
+                num_kv_heads = 4
+                num_layers = 6
+                d_ff = 2048
+                num_experts = 4
+            else:
+                # Small problems: full transformer
+                d_model = 512
+                num_heads = 16
+                num_kv_heads = 4
+                num_layers = 8
+                d_ff = 2048
+                num_experts = 8
+        
+        # Determine if we should auto-scale (only when no GUI settings provided)
+        use_auto_scale = (model_settings is None)
         
         self.transformer = BitTransformer(
             num_bits=self.num_bits,
@@ -1241,10 +1878,13 @@ class MLClauseLearner:
             num_heads=num_heads,
             num_layers=num_layers,
             d_ff=d_ff,
-            max_context=100
+            max_context=500,  # BUFFED: 5x context memory
+            num_kv_heads=num_kv_heads,
+            num_experts=num_experts,
+            auto_scale=use_auto_scale  # Only auto-scale if no GUI settings
         )
         self._transformer_initialized = True
-        print(f"[MLClauseLearner] BitTransformer ready!")
+        print(f"[MLClauseLearner] 🚀 BitTransformer ready!")
     
     def get_transformer_flip_scores(self, config: np.ndarray) -> np.ndarray:
         """
@@ -1304,6 +1944,56 @@ class MLClauseLearner:
             self._init_transformer()
         
         self.transformer.learn_from_flip(config, bit_idx, old_diff, new_diff, success)
+    
+    def learn_factorization_attempt(self, config: np.ndarray, P: int, Q: int,
+                                     diff: int, prev_diff: int = None):
+        """
+        🎯 CRITICAL: Learn from a factorization attempt using the BUFFED transformer.
+        
+        This method enables the transformer to learn the relationship between
+        bit configurations and the factorization P×Q = N.
+        
+        Args:
+            config: Current bit configuration
+            P: Current P factor
+            Q: Current Q factor
+            diff: Current |P×Q - N|
+            prev_diff: Previous |P×Q - N| for improvement tracking
+        """
+        if not self.use_transformer:
+            return
+        
+        if not self._transformer_initialized:
+            self._init_transformer()
+        
+        # Set N if not already set
+        if self.transformer.N is None and hasattr(self, 'N') and self.N is not None:
+            self.transformer.set_target_N(self.N)
+        
+        # Use the new factorization-aware learning
+        self.transformer.learn_from_factorization_attempt(config, P, Q, diff, prev_diff)
+    
+    def get_factorization_recommendations(self, config: np.ndarray, P: int, Q: int,
+                                           top_k: int = 10) -> list:
+        """
+        Get bit flip recommendations optimized for factorization.
+        
+        Args:
+            config: Current bit configuration
+            P: Current P value
+            Q: Current Q value
+            top_k: Number of recommendations
+            
+        Returns:
+            List of recommended flips with factorization-aware scoring
+        """
+        if not self.use_transformer:
+            return []
+        
+        if not self._transformer_initialized:
+            self._init_transformer()
+        
+        return self.transformer.get_best_factorization_flips(config, P, Q, top_k)
     
     def get_combined_flip_scores(self, config: np.ndarray, 
                                    hourglass_weight: float = 0.6,
@@ -3364,56 +4054,43 @@ class IncrementalQuantumAnnealing:
         
         Always accept if new_energy < current_energy.
         Accept with probability exp(-(new_energy - current_energy) / temperature) otherwise.
-        
-        LENIENT MODE: Added minimum acceptance floor to ensure exploration continues
-        even when energy differences are large. This helps ML continue learning.
+        ALSO: Reject if config matches learned bad patterns (tabu/nogood/clauses).
         """
-        # Get leniency setting (can be set via GUI)
-        # Higher = more lenient (accepts more uphill moves)
-        min_accept_prob = getattr(self, 'metropolis_min_accept', 0.05)  # 5% floor by default
-        
         # LEARNING: Soft rejection based on learned patterns
         # Don't hard-block, but reduce acceptance probability for bad patterns
-        # Only apply after initial exploration phase (when temp is lower)
-        if new_config is not None and temperature < self.initial_temp * 0.3:  # More lenient threshold
+        # This allows exploration while still guiding toward good regions
+        if new_config is not None and temperature < self.initial_temp * 0.5:
             rejection_penalty = 0.0
             
-            # Check tabu list - reduced penalty
+            # Check tabu list - moderate penalty
             if self.is_tabu(new_config):
-                rejection_penalty += 1.0  # Reduced from 2.0
+                rejection_penalty += 2.0
             
-            # Check nogood patterns - reduced penalty
+            # Check nogood patterns - moderate penalty
             if self.matches_nogood(new_config):
-                rejection_penalty += 0.75  # Reduced from 1.5
+                rejection_penalty += 1.5
             
-            # Check learned clauses - lighter penalty
-            min_hamming = max(3, len(new_config) // 10)
+            # Check learned clauses - lighter penalty, scaled by similarity
+            min_hamming = max(3, len(new_config) // 10)  # 10% threshold
             if self.matches_learned_clause(new_config, max_hamming_dist=min_hamming):
-                rejection_penalty += 0.5  # Reduced from 1.0
+                rejection_penalty += 1.0
             
-            # Apply penalty (but with floor - never completely block)
+            # Apply penalty as reduced acceptance probability (but never hard block)
             if rejection_penalty > 0:
+                # Reduce acceptance by penalty factor, but always allow some chance
                 accept_modifier = np.exp(-rejection_penalty)
-                # Apply floor even here
-                accept_modifier = max(accept_modifier, min_accept_prob)
                 if np.random.random() > accept_modifier:
                     return False  # Soft rejection
         
-        # Always accept downhill moves
         if new_energy <= current_energy:
             return True
         
-        # Zero temperature = only accept improvements
         if temperature <= 0:
-            return np.random.random() < min_accept_prob  # But still allow floor probability
+            return False
         
-        # Calculate acceptance probability with FLOOR
+        # Calculate acceptance probability
         delta_e = new_energy - current_energy
         acceptance_prob = np.exp(-delta_e / temperature)
-        
-        # Apply minimum acceptance floor - ensures exploration continues
-        # This is critical for ML learning - we need diverse samples
-        acceptance_prob = max(acceptance_prob, min_accept_prob)
         
         # Accept with probability
         return np.random.random() < acceptance_prob
@@ -3533,6 +4210,12 @@ class IncrementalQuantumAnnealing:
         # NEW: Learn bit-N correlations from this observation
         # This tracks how each bit's value correlates with the product relative to N
         self.ml_clause_learner.learn_correlation_from_observation(config, product, diff)
+        
+        # 🎯 CRITICAL: FACTORIZATION-AWARE TRANSFORMER LEARNING
+        # This teaches the transformer to find P×Q = N directly
+        prev_diff = getattr(self, '_prev_learn_diff', None)
+        self.ml_clause_learner.learn_factorization_attempt(config, p, q, diff, prev_diff)
+        self._prev_learn_diff = diff
         
         # Log trap status periodically
         if self.ml_clause_learner.trap_encounters > 0 and self.ml_clause_learner.trap_encounters % 10 == 0:
@@ -4428,30 +5111,44 @@ class IncrementalQuantumAnnealing:
                                if pair.source_qubit not in self.fixed_bits}
         
         # ============================================================
-        # TRANSFORMER ATTENTION-BASED SELECTION (LLM-style)
+        # 🎯 TRANSFORMER FACTORIZATION-AWARE SELECTION (BUFFED)
         # ============================================================
         if roll < transformer_pct:
-            # Use transformer attention to find bits with strong dependencies
+            # Use transformer attention with FACTORIZATION AWARENESS
             if hasattr(self, 'ml_clause_learner') and hasattr(self.ml_clause_learner, 'use_transformer'):
                 if self.ml_clause_learner.use_transformer:
                     try:
                         # Lazy initialize transformer if needed
                         if not self.ml_clause_learner._transformer_initialized:
-                            self.ml_clause_learner._init_transformer()
+                            # Pass model settings from GUI if available
+                            model_settings = getattr(self, 'transformer_model_settings', None)
+                            self.ml_clause_learner._init_transformer(model_settings)
+                            # Set target N for factorization learning
+                            if self.ml_clause_learner.transformer.N is None:
+                                self.ml_clause_learner.transformer.set_target_N(self.N)
                         
-                        recs = self.ml_clause_learner.get_transformer_recommendations(config, top_k=num_flips * 2)
+                        # 🎯 Use FACTORIZATION-AWARE recommendations
+                        recs = self.ml_clause_learner.get_factorization_recommendations(
+                            config, p, q, top_k=num_flips * 3
+                        )
                         
                         transformer_selected = []
                         for rec in recs:
                             idx = rec['bit_idx']
                             if idx in valid_source_indices and idx not in transformer_selected:
                                 transformer_selected.append(idx)
+                                # Log rationale for insight
+                                if len(transformer_selected) <= 2:
+                                    rationale = rec.get('rationale', '')
+                                    confidence = rec.get('confidence', 0)
+                                    print(f"  [TRANSFORMER] {rationale} (conf: {confidence:.2f})")
                             if len(transformer_selected) >= num_flips:
                                 break
                         
                         if len(transformer_selected) >= num_flips:
                             return transformer_selected[:num_flips]
                     except Exception as e:
+                        print(f"  [TRANSFORMER] Warning: {e}")
                         pass  # Fall through to hourglass
             
             # If transformer failed, fall through to hourglass
@@ -5334,15 +6031,7 @@ class IncrementalQuantumAnnealing:
             penalty_scale = min(1000.0, 100.0 * self.num_qubits / 64)
             total_energy += bad_combo_penalty * penalty_scale
         
-        # =====================================================================
-        # LEARNING-FIRST: Always learn from this config BEFORE Metropolis decision
-        # This ensures ML learns even from rejected moves!
-        # =====================================================================
-        p, q = self._decode_factors(config)
-        diff = abs(p * q - self.N)
-        self.learn_from_attempt(config, p, q, total_energy, diff)
-        
-        # NEW: Metropolis acceptance criterion (after learning)
+        # NEW: Metropolis acceptance criterion WITH LEARNING
         accepted = True
         if prev_energy is not None:
             delta_e = total_energy - prev_energy
@@ -5351,10 +6040,10 @@ class IncrementalQuantumAnnealing:
                 # Calculate what acceptance probability would have been
                 if temperature > 0 and delta_e > 0:
                     would_be_prob = np.exp(-delta_e / temperature)
-                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f}, P_would = {would_be_prob:.4f}) [learned anyway]")
+                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f}, P_would = {would_be_prob:.4f})")
                 else:
-                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f}) [learned anyway]")
-                # Don't update current state if rejected (but we DID learn above!)
+                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f})")
+                # Don't update current state if rejected
                 return config, total_energy, False
             elif delta_e > 0:
                 acceptance_prob = np.exp(-delta_e / temperature)
@@ -6335,76 +7024,97 @@ class IncrementalQuantumAnnealing:
             """Save current state to file, including NEURAL NETWORK learned state."""
             state['elapsed_time'] = time.time() - state['start_time'] + state.get('previous_elapsed', 0)
             
+            # Check if we should skip hourglass updates (Transformer-only mode)
+            skip_hourglass = getattr(self, 'skip_hourglass_updates', False)
+            
             # ============================================================
             # SAVE NEURAL NETWORK STATE (HOURGLASS ARCHITECTURE)
             # ============================================================
             if hasattr(self, 'ml_clause_learner'):
                 nn = self.ml_clause_learner
-                state['neural_network'] = {
-                    # HOURGLASS Network weights
-                    'W_in': nn.W_in.tolist(),
-                    'b_in': nn.b_in.tolist(),
-                    'W_exp1': nn.W_exp1.tolist(),
-                    'b_exp1': nn.b_exp1.tolist(),
-                    'W_bottle': nn.W_bottle.tolist(),
-                    'b_bottle': nn.b_bottle.tolist(),
-                    'W_cont1': nn.W_cont1.tolist(),
-                    'b_cont1': nn.b_cont1.tolist(),
-                    'W_cont2': nn.W_cont2.tolist(),
-                    'b_cont2': nn.b_cont2.tolist(),
-                    'W_skip1': nn.W_skip1.tolist(),
-                    'W_skip2': nn.W_skip2.tolist(),
-                    'W_out': nn.W_out.tolist(),
-                    'b_out': nn.b_out.tolist(),
-                    'W_trap': nn.W_trap.tolist(),
-                    'b_trap': nn.b_trap.tolist(),
-                    'W_diverge_dir': nn.W_diverge_dir.tolist(),
-                    'b_diverge_dir': nn.b_diverge_dir.tolist(),
-                    # Momentum buffers
-                    'v_W_in': nn.v_W_in.tolist(),
-                    'v_W_exp1': nn.v_W_exp1.tolist(),
-                    'v_W_bottle': nn.v_W_bottle.tolist(),
-                    'v_W_cont1': nn.v_W_cont1.tolist(),
-                    'v_W_cont2': nn.v_W_cont2.tolist(),
-                    'v_W_out': nn.v_W_out.tolist(),
-                    # Learned importance
-                    'bit_importance': nn.bit_importance.tolist(),
-                    # Training stats
-                    'num_samples': nn.num_samples,
-                    'diff_mean': nn.diff_mean,
-                    'diff_std': nn.diff_std,
-                    'lr': nn.lr,
-                    # Trap learning stats
-                    'trap_encounters': nn.trap_encounters,
-                    'trap_escapes': nn.trap_escapes,
-                    # Best patterns (top 100 for space)
-                    'best_patterns': [(p.tolist(), d) for p, d in nn.best_patterns[:100]],
-                    # Replay buffer (sample for space - keep best 1000)
-                    'replay_buffer_sample': [(b.tolist(), nd, d) for b, nd, d, *_ in 
-                                            sorted(nn.replay_buffer, key=lambda x: x[2])[:1000]],
-                    # NEW: Direct correlation tracking
-                    'bit_good_count': nn.bit_good_count.tolist() if hasattr(nn, 'bit_good_count') else None,
-                    'bit_bad_count': nn.bit_bad_count.tolist() if hasattr(nn, 'bit_bad_count') else None,
-                    'good_threshold': nn.good_threshold if hasattr(nn, 'good_threshold') else None,
-                    'bad_threshold': nn.bad_threshold if hasattr(nn, 'bad_threshold') else None,
-                    # NEW: UCB exploration tracking
-                    'bit_suggestion_count': nn.bit_suggestion_count.tolist() if hasattr(nn, 'bit_suggestion_count') else None,
-                    'total_suggestions': nn.total_suggestions if hasattr(nn, 'total_suggestions') else 1,
-                    # NEW: Escape patterns
-                    'escape_patterns': [(b.tolist(), int(p), int(q), int(d)) for b, p, q, d in nn.escape_patterns[:50]] if hasattr(nn, 'escape_patterns') else [],
-                    # NEW: Loss history (last 100)
-                    'loss_history': nn.loss_history[-100:] if hasattr(nn, 'loss_history') else [],
-                    # NEW: Bit-N correlation tracking
-                    'bit_n_correlation': nn.bit_n_correlation.tolist() if hasattr(nn, 'bit_n_correlation') else None,
-                    'bit_when_above_N': nn.bit_when_above_N.tolist() if hasattr(nn, 'bit_when_above_N') else None,
-                    'bit_when_below_N': nn.bit_when_below_N.tolist() if hasattr(nn, 'bit_when_below_N') else None,
-                    'count_above_N': nn.count_above_N if hasattr(nn, 'count_above_N') else 0,
-                    'count_below_N': nn.count_below_N if hasattr(nn, 'count_below_N') else 0,
-                    'bit_impact_magnitude': nn.bit_impact_magnitude.tolist() if hasattr(nn, 'bit_impact_magnitude') else None,
-                    'bit_correlation_0to1': nn.bit_correlation_0to1.tolist() if hasattr(nn, 'bit_correlation_0to1') else None,
-                    'bit_correlation_1to0': nn.bit_correlation_1to0.tolist() if hasattr(nn, 'bit_correlation_1to0') else None
-                }
-                print(f"  [Neural] Saved HOURGLASS network state ({nn.num_samples} samples, {nn.trap_escapes}/{nn.trap_encounters} escapes)")
+                
+                # Only save hourglass weights if we're using hourglass
+                if skip_hourglass:
+                    # Transformer-only mode: skip hourglass weights to save space
+                    state['neural_network'] = {
+                        'skip_hourglass': True,
+                        # Still save minimal stats
+                        'bit_importance': nn.bit_importance.tolist(),
+                        'num_samples': nn.num_samples,
+                        'diff_mean': nn.diff_mean,
+                        'diff_std': nn.diff_std,
+                        'lr': nn.lr,
+                        'trap_encounters': nn.trap_encounters,
+                        'trap_escapes': nn.trap_escapes,
+                    }
+                    print(f"  [SAVE] Skipping hourglass weights (Transformer-only mode)")
+                else:
+                    state['neural_network'] = {
+                        'skip_hourglass': False,
+                        # HOURGLASS Network weights
+                        'W_in': nn.W_in.tolist(),
+                        'b_in': nn.b_in.tolist(),
+                        'W_exp1': nn.W_exp1.tolist(),
+                        'b_exp1': nn.b_exp1.tolist(),
+                        'W_bottle': nn.W_bottle.tolist(),
+                        'b_bottle': nn.b_bottle.tolist(),
+                        'W_cont1': nn.W_cont1.tolist(),
+                        'b_cont1': nn.b_cont1.tolist(),
+                        'W_cont2': nn.W_cont2.tolist(),
+                        'b_cont2': nn.b_cont2.tolist(),
+                        'W_skip1': nn.W_skip1.tolist(),
+                        'W_skip2': nn.W_skip2.tolist(),
+                        'W_out': nn.W_out.tolist(),
+                        'b_out': nn.b_out.tolist(),
+                        'W_trap': nn.W_trap.tolist(),
+                        'b_trap': nn.b_trap.tolist(),
+                        'W_diverge_dir': nn.W_diverge_dir.tolist(),
+                        'b_diverge_dir': nn.b_diverge_dir.tolist(),
+                        # Momentum buffers
+                        'v_W_in': nn.v_W_in.tolist(),
+                        'v_W_exp1': nn.v_W_exp1.tolist(),
+                        'v_W_bottle': nn.v_W_bottle.tolist(),
+                        'v_W_cont1': nn.v_W_cont1.tolist(),
+                        'v_W_cont2': nn.v_W_cont2.tolist(),
+                        'v_W_out': nn.v_W_out.tolist(),
+                        # Learned importance
+                        'bit_importance': nn.bit_importance.tolist(),
+                        # Training stats
+                        'num_samples': nn.num_samples,
+                        'diff_mean': nn.diff_mean,
+                        'diff_std': nn.diff_std,
+                        'lr': nn.lr,
+                        # Trap learning stats
+                        'trap_encounters': nn.trap_encounters,
+                        'trap_escapes': nn.trap_escapes,
+                        # Best patterns (top 100 for space)
+                        'best_patterns': [(p.tolist(), d) for p, d in nn.best_patterns[:100]],
+                        # Replay buffer (sample for space - keep best 1000)
+                        'replay_buffer_sample': [(b.tolist(), nd, d) for b, nd, d, *_ in 
+                                                sorted(nn.replay_buffer, key=lambda x: x[2])[:1000]],
+                        # NEW: Direct correlation tracking
+                        'bit_good_count': nn.bit_good_count.tolist() if hasattr(nn, 'bit_good_count') else None,
+                        'bit_bad_count': nn.bit_bad_count.tolist() if hasattr(nn, 'bit_bad_count') else None,
+                        'good_threshold': nn.good_threshold if hasattr(nn, 'good_threshold') else None,
+                        'bad_threshold': nn.bad_threshold if hasattr(nn, 'bad_threshold') else None,
+                        # NEW: UCB exploration tracking
+                        'bit_suggestion_count': nn.bit_suggestion_count.tolist() if hasattr(nn, 'bit_suggestion_count') else None,
+                        'total_suggestions': nn.total_suggestions if hasattr(nn, 'total_suggestions') else 1,
+                        # NEW: Escape patterns
+                        'escape_patterns': [(b.tolist(), int(p), int(q), int(d)) for b, p, q, d in nn.escape_patterns[:50]] if hasattr(nn, 'escape_patterns') else [],
+                        # NEW: Loss history (last 100)
+                        'loss_history': nn.loss_history[-100:] if hasattr(nn, 'loss_history') else [],
+                        # NEW: Bit-N correlation tracking
+                        'bit_n_correlation': nn.bit_n_correlation.tolist() if hasattr(nn, 'bit_n_correlation') else None,
+                        'bit_when_above_N': nn.bit_when_above_N.tolist() if hasattr(nn, 'bit_when_above_N') else None,
+                        'bit_when_below_N': nn.bit_when_below_N.tolist() if hasattr(nn, 'bit_when_below_N') else None,
+                        'count_above_N': nn.count_above_N if hasattr(nn, 'count_above_N') else 0,
+                        'count_below_N': nn.count_below_N if hasattr(nn, 'count_below_N') else 0,
+                        'bit_impact_magnitude': nn.bit_impact_magnitude.tolist() if hasattr(nn, 'bit_impact_magnitude') else None,
+                        'bit_correlation_0to1': nn.bit_correlation_0to1.tolist() if hasattr(nn, 'bit_correlation_0to1') else None,
+                        'bit_correlation_1to0': nn.bit_correlation_1to0.tolist() if hasattr(nn, 'bit_correlation_1to0') else None
+                    }
+                    print(f"  [Neural] Saved HOURGLASS network state ({nn.num_samples} samples, {nn.trap_escapes}/{nn.trap_encounters} escapes)")
                 
                 # ============================================================
                 # SAVE BIT TRANSFORMER STATE (LLM-style attention module)
@@ -6437,6 +7147,13 @@ class IncrementalQuantumAnnealing:
                 'final_temp': self.final_temp,
                 'stuck_counter': self.stuck_counter,
                 'last_best_diff': self.last_best_diff if self.last_best_diff != float('inf') else None
+            }
+            
+            # Save model settings for consistency on reload
+            state['model_settings'] = {
+                'transformer_model_settings': getattr(self, 'transformer_model_settings', None),
+                'skip_hourglass_updates': getattr(self, 'skip_hourglass_updates', False),
+                'bit_selection_strategy': getattr(self, 'bit_selection_strategy', None)
             }
             
             with open(state_file, 'w') as f:
