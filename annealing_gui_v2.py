@@ -43,6 +43,41 @@ def get_safe_state_filename(n: int) -> str:
         bit_length = n.bit_length()
         return f"state_{bit_length}bit_{n_hash}.json"
 
+
+def compute_bit_accuracy(product: int, target: int) -> tuple:
+    """
+    Compute bit-level accuracy between P*Q product and target N.
+    
+    Returns:
+        (matching_bits, total_bits, percentage, matching_high_bits)
+    """
+    if product is None or target is None or target == 0:
+        return (0, 0, 0.0, 0)
+    
+    # XOR to find differing bits
+    xor_result = product ^ target
+    
+    # Total bits (use the larger of the two)
+    total_bits = max(product.bit_length(), target.bit_length())
+    
+    # Count differing bits (popcount)
+    differing_bits = bin(xor_result).count('1')
+    
+    # Matching bits
+    matching_bits = total_bits - differing_bits
+    
+    # Matching high-order bits (leading zeros in XOR = matching MSBs)
+    # This shows how many bits from the top are correct
+    if xor_result == 0:
+        matching_high_bits = total_bits  # Perfect match!
+    else:
+        matching_high_bits = total_bits - xor_result.bit_length()
+    
+    # Percentage
+    percentage = (matching_bits / total_bits * 100) if total_bits > 0 else 0.0
+    
+    return (matching_bits, total_bits, percentage, matching_high_bits)
+
 # Add the current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -660,6 +695,45 @@ class FactorizationGUI:
         self.stat_best_product = ttk.Label(best_frame, text="", style='Stats.TLabel')
         self.stat_best_product.pack(anchor=tk.W)
         
+        # Factorization Progress Bar
+        progress_frame = ttk.LabelFrame(stats_container, text="📊 Factorization Progress", padding=10)
+        progress_frame.pack(fill=tk.X, pady=5)
+        
+        # Progress label row
+        progress_label_frame = ttk.Frame(progress_frame)
+        progress_label_frame.pack(fill=tk.X)
+        
+        self.progress_pct_label = ttk.Label(progress_label_frame, text="0.00%", 
+                                            font=('Consolas', 12, 'bold'), style='Stats.TLabel')
+        self.progress_pct_label.pack(side=tk.LEFT)
+        
+        self.progress_detail_label = ttk.Label(progress_label_frame, text="  (waiting for data...)", 
+                                               style='Stats.TLabel')
+        self.progress_detail_label.pack(side=tk.LEFT, padx=10)
+        
+        # The actual progress bar
+        self.factorization_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, 
+                                                       length=400, mode='determinate')
+        self.factorization_progress.pack(fill=tk.X, pady=(5, 0))
+        
+        # Bit-level progress breakdown
+        bit_progress_frame = ttk.Frame(progress_frame)
+        bit_progress_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(bit_progress_frame, text="Bit Match:", style='Stats.TLabel').pack(side=tk.LEFT)
+        self.bit_progress_bar = ttk.Progressbar(bit_progress_frame, orient=tk.HORIZONTAL, 
+                                                 length=200, mode='determinate')
+        self.bit_progress_bar.pack(side=tk.LEFT, padx=5)
+        self.bit_progress_label = ttk.Label(bit_progress_frame, text="0/0", style='Stats.TLabel')
+        self.bit_progress_label.pack(side=tk.LEFT)
+        
+        ttk.Label(bit_progress_frame, text="  MSB:", style='Stats.TLabel').pack(side=tk.LEFT, padx=(20, 0))
+        self.msb_progress_bar = ttk.Progressbar(bit_progress_frame, orient=tk.HORIZONTAL, 
+                                                 length=150, mode='determinate')
+        self.msb_progress_bar.pack(side=tk.LEFT, padx=5)
+        self.msb_progress_label = ttk.Label(bit_progress_frame, text="0/0", style='Stats.TLabel')
+        self.msb_progress_label.pack(side=tk.LEFT)
+        
         # Learning Stats
         learn_frame = ttk.LabelFrame(stats_container, text="🧠 Learning Statistics", padding=10)
         learn_frame.pack(fill=tk.X, pady=5)
@@ -707,6 +781,11 @@ class FactorizationGUI:
         ttk.Label(learn_grid, text="Policy Network:", style='Stats.TLabel').grid(row=4, column=0, sticky=tk.W, padx=5)
         self.stat_policy = ttk.Label(learn_grid, text="Disabled", style='Stats.TLabel')
         self.stat_policy.grid(row=4, column=1, sticky=tk.W, padx=5)
+        
+        # Row 4 continued: Bit Accuracy (NEW)
+        ttk.Label(learn_grid, text="Bit Accuracy:", style='Stats.TLabel').grid(row=4, column=2, sticky=tk.W, padx=20)
+        self.stat_bit_accuracy = ttk.Label(learn_grid, text="-", style='Stats.TLabel')
+        self.stat_bit_accuracy.grid(row=4, column=3, sticky=tk.W, padx=5)
         
         ttk.Label(learn_grid, text="Carry Flips:", style='Stats.TLabel').grid(row=4, column=2, sticky=tk.W, padx=20)
         self.stat_carry_flips = ttk.Label(learn_grid, text="0", style='Stats.TLabel')
@@ -1729,6 +1808,86 @@ Tips:
                         self.stat_threshold.config(text="off: calc error")
                 else:
                     self.stat_threshold.config(text="off: ∞ (no data)")
+            
+            # NEW: Bit Accuracy & Progress Bars - compare best P*Q product to target N
+            try:
+                N = getattr(self.annealer, 'N', None)
+                elite_pop = getattr(self.annealer, 'elite_population', [])
+                
+                if N and elite_pop and len(elite_pop) > 0:
+                    # Get best solution (elite_population is sorted by diff)
+                    best = elite_pop[0]
+                    best_p = best.get('p', 0)
+                    best_q = best.get('q', 0)
+                    diff = best.get('diff', float('inf'))
+                    
+                    if best_p and best_q:
+                        product = best_p * best_q
+                        matching, total, pct, high_bits = compute_bit_accuracy(product, N)
+                        
+                        if product == N:
+                            self.stat_bit_accuracy.config(text=f"✓ EXACT! {total}/{total}")
+                            # 100% progress!
+                            self.factorization_progress['value'] = 100
+                            self.progress_pct_label.config(text="100.00% ✓ FACTORED!")
+                            self.progress_detail_label.config(text=f"  P×Q = N exactly!")
+                        else:
+                            # Show: matching/total (pct%) | MSB: high_bits
+                            self.stat_bit_accuracy.config(
+                                text=f"{matching}/{total} ({pct:.1f}%) MSB:{high_bits}"
+                            )
+                            
+                            # Calculate factorization progress using log scale
+                            # progress = 100 * (1 - log(diff) / log(N)) when diff > 0
+                            # This gives a more meaningful progress for huge numbers
+                            from decimal import Decimal
+                            import math as pymath
+                            
+                            if diff > 0 and N > 1:
+                                try:
+                                    # Use bit_length as proxy for log2 (works for huge ints)
+                                    log_diff = diff.bit_length() if isinstance(diff, int) else pymath.log2(float(diff))
+                                    log_N = N.bit_length() if isinstance(N, int) else pymath.log2(float(N))
+                                    
+                                    # Progress: 0% when diff ~ N, 100% when diff = 1
+                                    log_progress = max(0, min(100, 100 * (1 - log_diff / log_N)))
+                                    
+                                    self.factorization_progress['value'] = log_progress
+                                    self.progress_pct_label.config(text=f"{log_progress:.2f}%")
+                                    
+                                    # Detail: show diff magnitude
+                                    diff_bits = diff.bit_length() if isinstance(diff, int) else int(pymath.log2(float(diff)))
+                                    n_bits = N.bit_length() if isinstance(N, int) else int(pymath.log2(float(N)))
+                                    self.progress_detail_label.config(
+                                        text=f"  (diff: {diff_bits} bits, target: {n_bits} bits)"
+                                    )
+                                except:
+                                    self.factorization_progress['value'] = pct  # Fallback to bit accuracy
+                                    self.progress_pct_label.config(text=f"{pct:.2f}%")
+                            else:
+                                self.factorization_progress['value'] = 100
+                                self.progress_pct_label.config(text="100.00%")
+                        
+                        # Update bit progress bars
+                        if total > 0:
+                            self.bit_progress_bar['value'] = pct
+                            self.bit_progress_label.config(text=f"{matching}/{total}")
+                            
+                            msb_pct = (high_bits / total * 100) if total > 0 else 0
+                            self.msb_progress_bar['value'] = msb_pct
+                            self.msb_progress_label.config(text=f"{high_bits}/{total}")
+                    else:
+                        self.stat_bit_accuracy.config(text="-")
+                        self.factorization_progress['value'] = 0
+                        self.progress_pct_label.config(text="0.00%")
+                else:
+                    self.stat_bit_accuracy.config(text="-")
+                    self.factorization_progress['value'] = 0
+                    self.progress_pct_label.config(text="0.00%")
+                    self.progress_detail_label.config(text="  (waiting for data...)")
+            except Exception as e:
+                self.stat_bit_accuracy.config(text="calc err")
+                self.progress_detail_label.config(text=f"  (error: {str(e)[:30]})")
         
         # Schedule next update
         self.root.after(500, self.update_stats)
