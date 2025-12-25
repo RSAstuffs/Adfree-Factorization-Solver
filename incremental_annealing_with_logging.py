@@ -5661,10 +5661,10 @@ class IncrementalQuantumAnnealing:
                         if source_idx not in self.fixed_bits and source_idx not in selected_source_indices:
                             selected_source_indices.append(source_idx)
                             # Update p for next action selection
-                            p ^= (1 << action)
+                            p ^= (1 << int(action))  # Python int for large numbers
                 else:
                     # Flip bit in q (second half of pairs)
-                    bit_pos = action - n_bits
+                    bit_pos = int(action - n_bits)  # Python int for large numbers
                     pair_id = half + bit_pos
                     if pair_id < len(self.pairs):
                         source_idx = self.pairs[pair_id].source_qubit
@@ -6144,8 +6144,10 @@ class IncrementalQuantumAnnealing:
                 q_flips.append((bit_pos, new_val))
         
         # Calculate new p and q after direct flips (using Python int for bitwise ops)
+        # CRITICAL: All values must be Python int, not NumPy int, for large number bitwise ops
         new_p = int(old_p)
         for bit_pos, new_val in p_flips:
+            bit_pos = int(bit_pos)  # Convert to Python int for large bit positions
             if new_val == 1:
                 new_p |= (1 << bit_pos)
             else:
@@ -6153,6 +6155,7 @@ class IncrementalQuantumAnnealing:
         
         new_q = int(old_q)
         for bit_pos, new_val in q_flips:
+            bit_pos = int(bit_pos)  # Convert to Python int for large bit positions
             if new_val == 1:
                 new_q |= (1 << bit_pos)
             else:
@@ -6189,13 +6192,14 @@ class IncrementalQuantumAnnealing:
                 
                 # Calculate product change if we flip this bit
                 current_val = int(current_val)  # Ensure Python int
+                bit_pos = int(bit_pos)  # Ensure Python int for large bit positions
                 if is_p_bit:
                     test_p = int(new_p)  # Copy as Python int
                     if current_val == 0:
                         test_p |= (1 << bit_pos)
                     else:
                         test_p &= ~(1 << bit_pos)
-                    delta = test_p * new_q - new_p * new_q
+                    delta = test_p * int(new_q) - int(new_p) * int(new_q)
                 else:
                     test_q = int(new_q)  # Copy as Python int
                     if current_val == 0:
@@ -6238,7 +6242,7 @@ class IncrementalQuantumAnnealing:
                 # Update new_p or new_q for subsequent calculations
                 pair = self.pairs[source_idx // 2]
                 is_p_bit = pair.pair_id < half
-                bit_pos = pair.pair_id if is_p_bit else (pair.pair_id - half)
+                bit_pos = int(pair.pair_id if is_p_bit else (pair.pair_id - half))  # Python int!
                 current_val = int(config[source_idx])  # Ensure Python int
                 
                 if is_p_bit:
@@ -6292,16 +6296,17 @@ class IncrementalQuantumAnnealing:
         half = len(self.pairs) // 2
         
         # First half of pairs encode p
+        # Use Python int for shift to avoid overflow with large bit positions
         for i in range(half):
             pair = self.pairs[i]
             if pair.source_qubit < len(config) and config[pair.source_qubit] == 1:
-                p |= (1 << i)
+                p |= (1 << int(i))  # Python int for large numbers
         
         # Second half of pairs encode q  
         for i in range(half):
             pair = self.pairs[half + i]
             if pair.source_qubit < len(config) and config[pair.source_qubit] == 1:
-                q |= (1 << i)
+                q |= (1 << int(i))  # Python int for large numbers
         
         return p, q
     
@@ -8314,13 +8319,14 @@ class IncrementalQuantumAnnealing:
         q = 0
         
         # Build from LSB to MSB using bit manipulation to avoid overflow
+        # Use int(i) to ensure Python int for large bit positions
         for i, bit in enumerate(p_bits):
             if bit:
-                p |= (1 << i)
+                p |= (1 << int(i))
         
         for i, bit in enumerate(q_bits):
             if bit:
-                q |= (1 << i)
+                q |= (1 << int(i))
         
         # If the resulting numbers don't use full bit length, 
         # it means leading bits were 0 - this is actually fine
