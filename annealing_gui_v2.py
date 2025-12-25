@@ -366,6 +366,103 @@ class FactorizationGUI:
         self.nn_patterns_var = tk.StringVar(value="Best patterns: 0")
         ttk.Label(nn_frame, textvariable=self.nn_patterns_var).pack(anchor=tk.W)
         
+        # === Bit Selection Strategy ===
+        strategy_frame = ttk.LabelFrame(scroll_frame, text="🎛️ Bit Selection Strategy", padding=10)
+        strategy_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        ttk.Label(strategy_frame, text="Control which methods select bits to flip:", 
+                  font=('TkDefaultFont', 9)).pack(anchor=tk.W, pady=(0, 5))
+        
+        # Transformer % (LLM-style attention)
+        transformer_row = ttk.Frame(strategy_frame)
+        transformer_row.pack(fill=tk.X, pady=2)
+        ttk.Label(transformer_row, text="🤖 Transformer (Attention):", width=22).pack(side=tk.LEFT)
+        self.transformer_pct_var = tk.IntVar(value=30)
+        self.transformer_scale = ttk.Scale(transformer_row, from_=0, to=100, 
+                                           variable=self.transformer_pct_var,
+                                           orient=tk.HORIZONTAL, length=120,
+                                           command=self._on_strategy_change)
+        self.transformer_scale.pack(side=tk.LEFT, padx=5)
+        self.transformer_pct_label = ttk.Label(transformer_row, text="30%", width=5)
+        self.transformer_pct_label.pack(side=tk.LEFT)
+        
+        # Hourglass Neural Network %
+        hourglass_row = ttk.Frame(strategy_frame)
+        hourglass_row.pack(fill=tk.X, pady=2)
+        ttk.Label(hourglass_row, text="🧠 Hourglass Network:", width=22).pack(side=tk.LEFT)
+        self.hourglass_pct_var = tk.IntVar(value=50)
+        self.hourglass_scale = ttk.Scale(hourglass_row, from_=0, to=100,
+                                         variable=self.hourglass_pct_var,
+                                         orient=tk.HORIZONTAL, length=120,
+                                         command=self._on_strategy_change)
+        self.hourglass_scale.pack(side=tk.LEFT, padx=5)
+        self.hourglass_pct_label = ttk.Label(hourglass_row, text="50%", width=5)
+        self.hourglass_pct_label.pack(side=tk.LEFT)
+        
+        # Random Exploration %
+        random_row = ttk.Frame(strategy_frame)
+        random_row.pack(fill=tk.X, pady=2)
+        ttk.Label(random_row, text="🎲 Random Exploration:", width=22).pack(side=tk.LEFT)
+        self.random_pct_var = tk.IntVar(value=20)
+        self.random_scale = ttk.Scale(random_row, from_=0, to=100,
+                                      variable=self.random_pct_var,
+                                      orient=tk.HORIZONTAL, length=120,
+                                      command=self._on_strategy_change)
+        self.random_scale.pack(side=tk.LEFT, padx=5)
+        self.random_pct_label = ttk.Label(random_row, text="20%", width=5)
+        self.random_pct_label.pack(side=tk.LEFT)
+        
+        # Total indicator and normalize button
+        total_row = ttk.Frame(strategy_frame)
+        total_row.pack(fill=tk.X, pady=(5, 2))
+        self.strategy_total_var = tk.StringVar(value="Total: 100%")
+        ttk.Label(total_row, textvariable=self.strategy_total_var, 
+                  font=('TkDefaultFont', 9, 'bold')).pack(side=tk.LEFT)
+        ttk.Button(total_row, text="⚖️ Normalize", command=self._normalize_strategy,
+                   width=10).pack(side=tk.RIGHT)
+        
+        # Info label
+        ttk.Label(strategy_frame, text="💡 Transformer learns bit correlations via attention", 
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 0))
+        
+        # === Metropolis Acceptance Settings ===
+        metro_frame = ttk.LabelFrame(scroll_frame, text="🎰 Metropolis Acceptance", padding=10)
+        metro_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        ttk.Label(metro_frame, text="Controls how strictly uphill moves are rejected:", 
+                  font=('TkDefaultFont', 9)).pack(anchor=tk.W, pady=(0, 5))
+        
+        # Minimum acceptance probability slider
+        accept_row = ttk.Frame(metro_frame)
+        accept_row.pack(fill=tk.X, pady=2)
+        ttk.Label(accept_row, text="Min Accept Prob:", width=15).pack(side=tk.LEFT)
+        self.metro_min_accept_var = tk.DoubleVar(value=0.05)
+        self.metro_scale = ttk.Scale(accept_row, from_=0.0, to=0.30,
+                                      variable=self.metro_min_accept_var,
+                                      orient=tk.HORIZONTAL, length=100,
+                                      command=self._on_metro_change)
+        self.metro_scale.pack(side=tk.LEFT, padx=5)
+        self.metro_pct_label = ttk.Label(accept_row, text="5%", width=5)
+        self.metro_pct_label.pack(side=tk.LEFT)
+        
+        # Preset buttons
+        metro_preset_row = ttk.Frame(metro_frame)
+        metro_preset_row.pack(fill=tk.X, pady=(5, 2))
+        ttk.Button(metro_preset_row, text="Strict (1%)", width=10,
+                   command=lambda: self._set_metro_leniency(0.01)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(metro_preset_row, text="Normal (5%)", width=10,
+                   command=lambda: self._set_metro_leniency(0.05)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(metro_preset_row, text="Lenient (15%)", width=10,
+                   command=lambda: self._set_metro_leniency(0.15)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(metro_preset_row, text="Very Lenient (25%)", width=12,
+                   command=lambda: self._set_metro_leniency(0.25)).pack(side=tk.LEFT, padx=2)
+        
+        # Info
+        ttk.Label(metro_frame, text="💡 Higher = more exploration, better ML learning", 
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(metro_frame, text="💡 Lower = stricter convergence, less exploration", 
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W)
+        
         # === Legacy Policy Network (Optional - for initialization only) ===
         policy_frame = ttk.LabelFrame(scroll_frame, text="📦 Legacy PolicyNetwork (Init Only)", padding=10)
         policy_frame.pack(fill=tk.X, pady=5, padx=5)
@@ -947,6 +1044,75 @@ Tips:
             self.final_temp_var.set("0.01")
             self.temp_info_label.config(text="⚠️ Manual mode - adjust for your N size")
     
+    def _on_strategy_change(self, *args):
+        """Callback when bit selection strategy sliders change."""
+        transformer_pct = self.transformer_pct_var.get()
+        hourglass_pct = self.hourglass_pct_var.get()
+        random_pct = self.random_pct_var.get()
+        
+        # Update labels
+        self.transformer_pct_label.config(text=f"{transformer_pct}%")
+        self.hourglass_pct_label.config(text=f"{hourglass_pct}%")
+        self.random_pct_label.config(text=f"{random_pct}%")
+        
+        # Update total
+        total = transformer_pct + hourglass_pct + random_pct
+        if total == 100:
+            self.strategy_total_var.set(f"Total: {total}% ✓")
+        else:
+            self.strategy_total_var.set(f"Total: {total}% ⚠️")
+    
+    def _normalize_strategy(self):
+        """Normalize strategy percentages to sum to 100%."""
+        transformer_pct = self.transformer_pct_var.get()
+        hourglass_pct = self.hourglass_pct_var.get()
+        random_pct = self.random_pct_var.get()
+        
+        total = transformer_pct + hourglass_pct + random_pct
+        
+        if total == 0:
+            # Default: even split
+            self.transformer_pct_var.set(33)
+            self.hourglass_pct_var.set(34)
+            self.random_pct_var.set(33)
+        else:
+            # Normalize proportionally
+            factor = 100.0 / total
+            new_transformer = int(round(transformer_pct * factor))
+            new_hourglass = int(round(hourglass_pct * factor))
+            new_random = 100 - new_transformer - new_hourglass  # Ensure exact 100
+            
+            self.transformer_pct_var.set(new_transformer)
+            self.hourglass_pct_var.set(new_hourglass)
+            self.random_pct_var.set(new_random)
+        
+        # Update display
+        self._on_strategy_change()
+    
+    def get_bit_selection_strategy(self) -> dict:
+        """Get the current bit selection strategy percentages."""
+        return {
+            'transformer_pct': self.transformer_pct_var.get(),
+            'hourglass_pct': self.hourglass_pct_var.get(),
+            'random_pct': self.random_pct_var.get()
+        }
+    
+    def _on_metro_change(self, *args):
+        """Callback when Metropolis leniency slider changes."""
+        value = self.metro_min_accept_var.get()
+        self.metro_pct_label.config(text=f"{value*100:.0f}%")
+    
+    def _set_metro_leniency(self, value: float):
+        """Set Metropolis leniency to a preset value."""
+        self.metro_min_accept_var.set(value)
+        self._on_metro_change()
+    
+    def get_metropolis_settings(self) -> dict:
+        """Get the current Metropolis acceptance settings."""
+        return {
+            'min_accept_prob': self.metro_min_accept_var.get()
+        }
+    
     def browse_state_file(self):
         """Browse for state file."""
         filename = filedialog.asksaveasfilename(
@@ -1194,6 +1360,18 @@ Tips:
                 final_temp=final_temp,
                 state_file=state_file
             )
+            
+            # Set bit selection strategy from GUI
+            strategy = self.get_bit_selection_strategy()
+            self.annealer.bit_selection_strategy = strategy
+            self.log(f"🎛️ Bit selection: Transformer {strategy['transformer_pct']}%, "
+                     f"Hourglass {strategy['hourglass_pct']}%, Random {strategy['random_pct']}%")
+            
+            # Set Metropolis acceptance settings from GUI
+            metro_settings = self.get_metropolis_settings()
+            self.annealer.metropolis_min_accept = metro_settings['min_accept_prob']
+            self.log(f"🎰 Metropolis: Min accept = {metro_settings['min_accept_prob']*100:.0f}% "
+                     f"({'lenient' if metro_settings['min_accept_prob'] > 0.1 else 'normal' if metro_settings['min_accept_prob'] > 0.02 else 'strict'})")
             
             # Load policy network if specified
             policy_file = self.policy_file_var.get() if hasattr(self, 'policy_file_var') else ""
