@@ -1055,6 +1055,15 @@ class FactorizationGUI:
         self.train_params = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
         self.train_params.grid(row=2, column=3, sticky=tk.W, padx=5)
         
+        # Row 3: GPU Acceleration
+        ttk.Label(arch_grid, text="GPU Acceleration:", style='Stats.TLabel').grid(row=3, column=0, sticky=tk.W, padx=5)
+        self.train_gpu_status = ttk.Label(arch_grid, text="Checking...", style='Stats.TLabel')
+        self.train_gpu_status.grid(row=3, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(arch_grid, text="GPU Device:", style='Stats.TLabel').grid(row=3, column=2, sticky=tk.W, padx=20)
+        self.train_gpu_device = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_gpu_device.grid(row=3, column=3, sticky=tk.W, padx=5)
+        
         # === Training Progress ===
         progress_frame = ttk.LabelFrame(scroll_frame, text="📊 Training Progress", padding=10)
         progress_frame.pack(fill=tk.X, pady=5, padx=5)
@@ -1191,6 +1200,21 @@ class FactorizationGUI:
                 self.train_params.config(text=f"{params/1_000_000:.2f}M")
             else:
                 self.train_params.config(text=f"{params:,}")
+        
+        # GPU status - try to get from the module
+        try:
+            from incremental_annealing_with_logging import GPU_AVAILABLE, GPU_BACKEND, get_gpu_info
+            if GPU_AVAILABLE:
+                gpu_info = get_gpu_info()
+                self.train_gpu_status.config(text=f"✅ {GPU_BACKEND}")
+                device_name = gpu_info.get('device_name', gpu_info.get('device', 'GPU'))
+                self.train_gpu_device.config(text=str(device_name))
+            else:
+                self.train_gpu_status.config(text="❌ CPU Only")
+                self.train_gpu_device.config(text="NumPy")
+        except:
+            self.train_gpu_status.config(text="❓ Unknown")
+            self.train_gpu_device.config(text="-")
         
         # Training progress
         self.train_steps.config(text=str(getattr(transformer, 't', 0)))
