@@ -373,43 +373,43 @@ class FactorizationGUI:
         ttk.Label(strategy_frame, text="Control which methods select bits to flip:", 
                   font=('TkDefaultFont', 9)).pack(anchor=tk.W, pady=(0, 5))
         
-        # Transformer % (LLM-style attention)
+        # Transformer % (LLM-style attention) - NOW PRIMARY
         transformer_row = ttk.Frame(strategy_frame)
         transformer_row.pack(fill=tk.X, pady=2)
-        ttk.Label(transformer_row, text="🤖 Transformer (Attention):", width=22).pack(side=tk.LEFT)
-        self.transformer_pct_var = tk.IntVar(value=30)
+        ttk.Label(transformer_row, text="🤖 Transformer (Primary):", width=22).pack(side=tk.LEFT)
+        self.transformer_pct_var = tk.IntVar(value=50)  # Increased from 30 to 50
         self.transformer_scale = ttk.Scale(transformer_row, from_=0, to=100, 
                                            variable=self.transformer_pct_var,
                                            orient=tk.HORIZONTAL, length=120,
                                            command=self._on_strategy_change)
         self.transformer_scale.pack(side=tk.LEFT, padx=5)
-        self.transformer_pct_label = ttk.Label(transformer_row, text="30%", width=5)
+        self.transformer_pct_label = ttk.Label(transformer_row, text="50%", width=5)
         self.transformer_pct_label.pack(side=tk.LEFT)
         
-        # Hourglass Neural Network %
+        # Hourglass Neural Network % - NOW SECONDARY
         hourglass_row = ttk.Frame(strategy_frame)
         hourglass_row.pack(fill=tk.X, pady=2)
-        ttk.Label(hourglass_row, text="🧠 Hourglass Network:", width=22).pack(side=tk.LEFT)
-        self.hourglass_pct_var = tk.IntVar(value=50)
+        ttk.Label(hourglass_row, text="🧠 Hourglass (Secondary):", width=22).pack(side=tk.LEFT)
+        self.hourglass_pct_var = tk.IntVar(value=35)  # Reduced from 50 to 35
         self.hourglass_scale = ttk.Scale(hourglass_row, from_=0, to=100,
                                          variable=self.hourglass_pct_var,
                                          orient=tk.HORIZONTAL, length=120,
                                          command=self._on_strategy_change)
         self.hourglass_scale.pack(side=tk.LEFT, padx=5)
-        self.hourglass_pct_label = ttk.Label(hourglass_row, text="50%", width=5)
+        self.hourglass_pct_label = ttk.Label(hourglass_row, text="35%", width=5)
         self.hourglass_pct_label.pack(side=tk.LEFT)
         
         # Random Exploration %
         random_row = ttk.Frame(strategy_frame)
         random_row.pack(fill=tk.X, pady=2)
         ttk.Label(random_row, text="🎲 Random Exploration:", width=22).pack(side=tk.LEFT)
-        self.random_pct_var = tk.IntVar(value=20)
+        self.random_pct_var = tk.IntVar(value=15)  # Reduced from 20 to 15
         self.random_scale = ttk.Scale(random_row, from_=0, to=100,
                                       variable=self.random_pct_var,
                                       orient=tk.HORIZONTAL, length=120,
                                       command=self._on_strategy_change)
         self.random_scale.pack(side=tk.LEFT, padx=5)
-        self.random_pct_label = ttk.Label(random_row, text="20%", width=5)
+        self.random_pct_label = ttk.Label(random_row, text="15%", width=5)
         self.random_pct_label.pack(side=tk.LEFT)
         
         # Total indicator and normalize button
@@ -422,8 +422,79 @@ class FactorizationGUI:
                    width=10).pack(side=tk.RIGHT)
         
         # Info label
-        ttk.Label(strategy_frame, text="💡 Transformer learns bit correlations via attention", 
+        ttk.Label(strategy_frame, text="💡 Transformer is PRIMARY - uses attention to find bit relationships", 
                   foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(strategy_frame, text="💡 Hourglass is SECONDARY - modulated by transformer attention", 
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W)
+        
+        # === Transformer Model Presets ===
+        model_frame = ttk.LabelFrame(scroll_frame, text="🚀 Transformer Model Size", padding=10)
+        model_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        ttk.Label(model_frame, text="Select how 'buffed' the transformer should be:", 
+                  font=('TkDefaultFont', 9)).pack(anchor=tk.W, pady=(0, 5))
+        
+        # Model preset dropdown
+        preset_row = ttk.Frame(model_frame)
+        preset_row.pack(fill=tk.X, pady=2)
+        ttk.Label(preset_row, text="Model Preset:", width=12).pack(side=tk.LEFT)
+        self.model_preset_var = tk.StringVar(value="Medium")
+        self.model_preset_combo = ttk.Combobox(preset_row, textvariable=self.model_preset_var,
+                                                values=["Light", "Medium", "Heavy", "Ultra", "Custom"],
+                                                state="readonly", width=12)
+        self.model_preset_combo.pack(side=tk.LEFT, padx=5)
+        self.model_preset_combo.bind("<<ComboboxSelected>>", self._on_model_preset_change)
+        
+        # Model stats display
+        self.model_stats_var = tk.StringVar(value="📊 ~8M params | 256 dim | 4 layers | 8 heads")
+        ttk.Label(model_frame, textvariable=self.model_stats_var,
+                  font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 5))
+        
+        # Custom settings (expandable)
+        self.custom_model_frame = ttk.Frame(model_frame)
+        self.custom_model_frame.pack(fill=tk.X, pady=2)
+        
+        # d_model
+        dmodel_row = ttk.Frame(self.custom_model_frame)
+        dmodel_row.pack(fill=tk.X, pady=1)
+        ttk.Label(dmodel_row, text="d_model:", width=10).pack(side=tk.LEFT)
+        self.dmodel_var = tk.IntVar(value=256)
+        self.dmodel_spin = ttk.Spinbox(dmodel_row, from_=64, to=1024, increment=64,
+                                        textvariable=self.dmodel_var, width=8)
+        self.dmodel_spin.pack(side=tk.LEFT, padx=5)
+        
+        # num_layers
+        ttk.Label(dmodel_row, text="Layers:", width=8).pack(side=tk.LEFT, padx=(10, 0))
+        self.nlayers_var = tk.IntVar(value=4)
+        self.nlayers_spin = ttk.Spinbox(dmodel_row, from_=2, to=12, increment=1,
+                                         textvariable=self.nlayers_var, width=5)
+        self.nlayers_spin.pack(side=tk.LEFT, padx=5)
+        
+        # num_heads
+        heads_row = ttk.Frame(self.custom_model_frame)
+        heads_row.pack(fill=tk.X, pady=1)
+        ttk.Label(heads_row, text="Heads:", width=10).pack(side=tk.LEFT)
+        self.nheads_var = tk.IntVar(value=8)
+        self.nheads_spin = ttk.Spinbox(heads_row, from_=4, to=32, increment=4,
+                                        textvariable=self.nheads_var, width=8)
+        self.nheads_spin.pack(side=tk.LEFT, padx=5)
+        
+        # num_experts
+        ttk.Label(heads_row, text="Experts:", width=8).pack(side=tk.LEFT, padx=(10, 0))
+        self.nexperts_var = tk.IntVar(value=4)
+        self.nexperts_spin = ttk.Spinbox(heads_row, from_=2, to=16, increment=2,
+                                          textvariable=self.nexperts_var, width=5)
+        self.nexperts_spin.pack(side=tk.LEFT, padx=5)
+        
+        # Initially hide custom settings
+        self.custom_model_frame.pack_forget()
+        
+        # Preset info
+        ttk.Label(model_frame, text="💡 Light: Fast, less memory | Heavy/Ultra: Better accuracy, slower", 
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 0))
+        
+        # Apply the default preset
+        self._on_model_preset_change(None)
         
         # === Metropolis Acceptance Settings ===
         metro_frame = ttk.LabelFrame(scroll_frame, text="🎰 Metropolis Acceptance", padding=10)
@@ -1097,6 +1168,44 @@ Tips:
             'random_pct': self.random_pct_var.get()
         }
     
+    def _on_model_preset_change(self, event):
+        """Handle model preset dropdown change."""
+        preset = self.model_preset_var.get()
+        
+        # Model presets: (d_model, num_layers, num_heads, num_experts, params_approx)
+        presets = {
+            "Light": (128, 2, 4, 2, "~2M"),
+            "Medium": (256, 4, 8, 4, "~8M"),
+            "Heavy": (512, 6, 16, 4, "~33M"),
+            "Ultra": (768, 8, 16, 8, "~76M"),
+        }
+        
+        if preset == "Custom":
+            # Show custom settings
+            self.custom_model_frame.pack(fill=tk.X, pady=2)
+            self.model_stats_var.set("📊 Custom settings - adjust below")
+        else:
+            # Hide custom settings
+            self.custom_model_frame.pack_forget()
+            
+            if preset in presets:
+                d_model, num_layers, num_heads, num_experts, params = presets[preset]
+                self.dmodel_var.set(d_model)
+                self.nlayers_var.set(num_layers)
+                self.nheads_var.set(num_heads)
+                self.nexperts_var.set(num_experts)
+                self.model_stats_var.set(f"📊 {params} params | {d_model} dim | {num_layers} layers | {num_heads} heads | {num_experts} experts")
+    
+    def get_model_settings(self) -> dict:
+        """Get the current transformer model settings."""
+        return {
+            'd_model': self.dmodel_var.get(),
+            'num_layers': self.nlayers_var.get(),
+            'num_heads': self.nheads_var.get(),
+            'num_experts': self.nexperts_var.get(),
+            'preset': self.model_preset_var.get()
+        }
+    
     def _on_metro_change(self, *args):
         """Callback when Metropolis leniency slider changes."""
         value = self.metro_min_accept_var.get()
@@ -1372,6 +1481,23 @@ Tips:
             self.annealer.metropolis_min_accept = metro_settings['min_accept_prob']
             self.log(f"🎰 Metropolis: Min accept = {metro_settings['min_accept_prob']*100:.0f}% "
                      f"({'lenient' if metro_settings['min_accept_prob'] > 0.1 else 'normal' if metro_settings['min_accept_prob'] > 0.02 else 'strict'})")
+            
+            # Set transformer model settings from GUI - IMPORTANT: set on BOTH annealer AND MLClauseLearner
+            model_settings = self.get_model_settings()
+            self.annealer.transformer_model_settings = model_settings
+            # Also set directly on MLClauseLearner so it's available before first transformer init
+            if hasattr(self.annealer, 'ml_clause_learner'):
+                self.annealer.ml_clause_learner.set_transformer_model_settings(model_settings)
+            self.log(f"🚀 Transformer: {model_settings['preset']} preset "
+                     f"({model_settings['d_model']} dim, {model_settings['num_layers']} layers, "
+                     f"{model_settings['num_heads']} heads, {model_settings['num_experts']} experts)")
+            
+            # If hourglass is 0%, set flag to skip hourglass updates
+            if strategy['hourglass_pct'] == 0:
+                self.annealer.skip_hourglass_updates = True
+                self.log(f"⚡ Hourglass=0%: Skipping hourglass state updates (Transformer-only mode)")
+            else:
+                self.annealer.skip_hourglass_updates = False
             
             # Load policy network if specified
             policy_file = self.policy_file_var.get() if hasattr(self, 'policy_file_var') else ""
