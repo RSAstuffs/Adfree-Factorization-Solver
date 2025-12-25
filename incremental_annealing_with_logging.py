@@ -263,6 +263,39 @@ class MLClauseLearner:
         self.N = None
         self.sqrt_N = None
         
+        # =====================================================================
+        # BIT-N CORRELATION TRACKING (learns actual impact of each bit on p*q-N)
+        # =====================================================================
+        # For each bit position, track:
+        # - How setting bit=1 affects the difference from N (positive = away, negative = closer)
+        # - The magnitude of impact (some bits have larger effect than others)
+        # - Correlation with product proximity to N (not just good/bad)
+        
+        # Running statistics for each bit position and direction
+        # Format: [sum_of_impacts, sum_of_squares, count] for computing mean and variance
+        self.bit_correlation_0to1 = np.zeros((num_bits, 3))  # Impact when flipping 0->1
+        self.bit_correlation_1to0 = np.zeros((num_bits, 3))  # Impact when flipping 1->0
+        
+        # Signed correlation: does this bit being 1 correlate with being CLOSER or FARTHER from N?
+        # Positive = bit=1 tends to push AWAY from N, Negative = bit=1 tends to push TOWARD N
+        self.bit_n_correlation = np.zeros(num_bits)
+        self.bit_n_correlation_count = np.zeros(num_bits)
+        
+        # Track relationship between bit values and sign of (p*q - N)
+        # When p*q > N: which bits being 1 correlate? When p*q < N: which bits?
+        self.bit_when_above_N = np.zeros(num_bits)  # Avg bit value when p*q > N
+        self.bit_when_below_N = np.zeros(num_bits)  # Avg bit value when p*q < N
+        self.count_above_N = 0
+        self.count_below_N = 0
+        
+        # Impact magnitude: how much does each bit position affect |p*q - N|?
+        self.bit_impact_magnitude = np.ones(num_bits)  # EMA of absolute impact
+        
+        # Previous state for tracking transitions
+        self.prev_config = None
+        self.prev_product = None
+        self.prev_diff = None
+        
     def set_N(self, N: int):
         """Set the target number N for trap detection."""
         import math
@@ -486,14 +519,17 @@ class MLClauseLearner:
         
         # Input -> Expand1
         self.z_in = extended_input @ self.W_in + self.b_in
+        self.z_in = np.clip(self.z_in, -1e6, 1e6)  # Prevent overflow
         self.a_exp1 = self._leaky_relu(self.z_in)  # Save for skip connection
         
         # Expand1 -> Expand2 (widening)
         self.z_exp1 = self.a_exp1 @ self.W_exp1 + self.b_exp1
+        self.z_exp1 = np.clip(self.z_exp1, -1e6, 1e6)  # Prevent overflow
         self.a_exp2 = self._leaky_relu(self.z_exp1)  # Save for skip connection
         
         # Expand2 -> Bottleneck (compression - the narrow waist)
         self.z_bottle = self.a_exp2 @ self.W_bottle + self.b_bottle
+        self.z_bottle = np.clip(self.z_bottle, -1e6, 1e6)  # Prevent overflow
         self.a_bottle = self._leaky_relu(self.z_bottle)
         
         # =================================================================
@@ -502,14 +538,18 @@ class MLClauseLearner:
         
         # Bottleneck -> Contract1 (expanding from bottleneck)
         self.z_cont1 = self.a_bottle @ self.W_cont1 + self.b_cont1
+        self.z_cont1 = np.clip(self.z_cont1, -1e6, 1e6)  # Prevent overflow
         # ADD SKIP CONNECTION from Expand2 (lateral connection across bottleneck)
         self.z_cont1_skip = self.z_cont1 + self.a_exp2 @ self.W_skip2
+        self.z_cont1_skip = np.clip(self.z_cont1_skip, -1e6, 1e6)  # Prevent overflow
         self.a_cont1 = self._leaky_relu(self.z_cont1_skip)
         
         # Contract1 -> Contract2 (narrowing)
         self.z_cont2 = self.a_cont1 @ self.W_cont2 + self.b_cont2
+        self.z_cont2 = np.clip(self.z_cont2, -1e6, 1e6)  # Prevent overflow
         # ADD SKIP CONNECTION from Expand1 (long skip connection)
         self.z_cont2_skip = self.z_cont2 + self.a_exp1 @ self.W_skip1
+        self.z_cont2_skip = np.clip(self.z_cont2_skip, -1e6, 1e6)  # Prevent overflow
         self.a_cont2 = self._leaky_relu(self.z_cont2_skip)
         
         # =================================================================
@@ -518,6 +558,7 @@ class MLClauseLearner:
         
         # Main output: predicted log-diff
         self.output = self.a_cont2 @ self.W_out + self.b_out
+        self.output = np.clip(self.output, -1e6, 1e6)  # Prevent overflow
         
         # TRAP HEAD: Predict trap probability (sigmoid for 0-1 range)
         trap_logit = self.a_cont2 @ self.W_trap + self.b_trap
@@ -540,8 +581,10 @@ class MLClauseLearner:
         """
         # Gradient of loss (MSE) for diff prediction
         pred = self.output[0]
-        loss = (pred - target_log_diff) ** 2
-        d_out = 2 * (pred - target_log_diff)
+        # Clip the prediction difference to prevent overflow in squaring
+        pred_diff = np.clip(pred - target_log_diff, -1e6, 1e6)
+        loss = pred_diff ** 2
+        d_out = np.clip(2 * pred_diff, -1e6, 1e6)
         
         # TRAP HEAD LOSS: Binary cross-entropy
         trap_loss = 0.0
@@ -636,6 +679,8 @@ class MLClauseLearner:
         # Expand1 <- Expand2 (plus skip gradient from Contract2)
         d_a_exp1 = d_z_exp1 @ self.W_exp1.T + d_a_exp1_skip
         d_z_in = d_a_exp1 * self._leaky_relu_grad(self.z_in)
+        # Clip d_z_in to prevent overflow in bit_grads calculation
+        d_z_in = np.clip(d_z_in, -1.0, 1.0)
         
         extended_input = np.concatenate([self.input_bits, self.trap_features])
         d_W_in = np.outer(extended_input, d_z_in)
@@ -659,24 +704,25 @@ class MLClauseLearner:
         # =================================================================
         # MOMENTUM UPDATES
         # =================================================================
-        self.v_W_in = self.momentum * self.v_W_in - self.lr * d_W_in
-        self.v_b_in = self.momentum * self.v_b_in - self.lr * d_b_in
-        self.v_W_exp1 = self.momentum * self.v_W_exp1 - self.lr * d_W_exp1
-        self.v_b_exp1 = self.momentum * self.v_b_exp1 - self.lr * d_b_exp1
-        self.v_W_bottle = self.momentum * self.v_W_bottle - self.lr * d_W_bottle
-        self.v_b_bottle = self.momentum * self.v_b_bottle - self.lr * d_b_bottle
-        self.v_W_cont1 = self.momentum * self.v_W_cont1 - self.lr * d_W_cont1
-        self.v_b_cont1 = self.momentum * self.v_b_cont1 - self.lr * d_b_cont1
-        self.v_W_cont2 = self.momentum * self.v_W_cont2 - self.lr * d_W_cont2
-        self.v_b_cont2 = self.momentum * self.v_b_cont2 - self.lr * d_b_cont2
-        self.v_W_skip1 = self.momentum * self.v_W_skip1 - self.lr * d_W_skip1
-        self.v_W_skip2 = self.momentum * self.v_W_skip2 - self.lr * d_W_skip2
-        self.v_W_out = self.momentum * self.v_W_out - self.lr * d_W_out
-        self.v_b_out = self.momentum * self.v_b_out - self.lr * d_b_out
-        self.v_W_trap = self.momentum * self.v_W_trap - self.lr * d_W_trap
-        self.v_b_trap = self.momentum * self.v_b_trap - self.lr * d_b_trap
-        self.v_W_diverge_dir = self.momentum * self.v_W_diverge_dir - self.lr * d_W_diverge
-        self.v_b_diverge_dir = self.momentum * self.v_b_diverge_dir - self.lr * d_b_diverge
+        momentum_clip = 1.0  # Clip momentum to prevent accumulation overflow
+        self.v_W_in = np.clip(self.momentum * self.v_W_in - self.lr * d_W_in, -momentum_clip, momentum_clip)
+        self.v_b_in = np.clip(self.momentum * self.v_b_in - self.lr * d_b_in, -momentum_clip, momentum_clip)
+        self.v_W_exp1 = np.clip(self.momentum * self.v_W_exp1 - self.lr * d_W_exp1, -momentum_clip, momentum_clip)
+        self.v_b_exp1 = np.clip(self.momentum * self.v_b_exp1 - self.lr * d_b_exp1, -momentum_clip, momentum_clip)
+        self.v_W_bottle = np.clip(self.momentum * self.v_W_bottle - self.lr * d_W_bottle, -momentum_clip, momentum_clip)
+        self.v_b_bottle = np.clip(self.momentum * self.v_b_bottle - self.lr * d_b_bottle, -momentum_clip, momentum_clip)
+        self.v_W_cont1 = np.clip(self.momentum * self.v_W_cont1 - self.lr * d_W_cont1, -momentum_clip, momentum_clip)
+        self.v_b_cont1 = np.clip(self.momentum * self.v_b_cont1 - self.lr * d_b_cont1, -momentum_clip, momentum_clip)
+        self.v_W_cont2 = np.clip(self.momentum * self.v_W_cont2 - self.lr * d_W_cont2, -momentum_clip, momentum_clip)
+        self.v_b_cont2 = np.clip(self.momentum * self.v_b_cont2 - self.lr * d_b_cont2, -momentum_clip, momentum_clip)
+        self.v_W_skip1 = np.clip(self.momentum * self.v_W_skip1 - self.lr * d_W_skip1, -momentum_clip, momentum_clip)
+        self.v_W_skip2 = np.clip(self.momentum * self.v_W_skip2 - self.lr * d_W_skip2, -momentum_clip, momentum_clip)
+        self.v_W_out = np.clip(self.momentum * self.v_W_out - self.lr * d_W_out, -momentum_clip, momentum_clip)
+        self.v_b_out = np.clip(self.momentum * self.v_b_out - self.lr * d_b_out, -momentum_clip, momentum_clip)
+        self.v_W_trap = np.clip(self.momentum * self.v_W_trap - self.lr * d_W_trap, -momentum_clip, momentum_clip)
+        self.v_b_trap = np.clip(self.momentum * self.v_b_trap - self.lr * d_b_trap, -momentum_clip, momentum_clip)
+        self.v_W_diverge_dir = np.clip(self.momentum * self.v_W_diverge_dir - self.lr * d_W_diverge, -momentum_clip, momentum_clip)
+        self.v_b_diverge_dir = np.clip(self.momentum * self.v_b_diverge_dir - self.lr * d_b_diverge, -momentum_clip, momentum_clip)
         
         # =================================================================
         # APPLY UPDATES
@@ -699,6 +745,29 @@ class MLClauseLearner:
         self.b_trap += self.v_b_trap
         self.W_diverge_dir += self.v_W_diverge_dir
         self.b_diverge_dir += self.v_b_diverge_dir
+        
+        # =================================================================
+        # WEIGHT CLIPPING (prevent overflow in forward pass)
+        # =================================================================
+        weight_clip = 10.0
+        self.W_in = np.clip(self.W_in, -weight_clip, weight_clip)
+        self.W_exp1 = np.clip(self.W_exp1, -weight_clip, weight_clip)
+        self.W_bottle = np.clip(self.W_bottle, -weight_clip, weight_clip)
+        self.W_cont1 = np.clip(self.W_cont1, -weight_clip, weight_clip)
+        self.W_cont2 = np.clip(self.W_cont2, -weight_clip, weight_clip)
+        self.W_skip1 = np.clip(self.W_skip1, -weight_clip, weight_clip)
+        self.W_skip2 = np.clip(self.W_skip2, -weight_clip, weight_clip)
+        self.W_out = np.clip(self.W_out, -weight_clip, weight_clip)
+        self.W_trap = np.clip(self.W_trap, -weight_clip, weight_clip)
+        self.W_diverge_dir = np.clip(self.W_diverge_dir, -weight_clip, weight_clip)
+        self.b_in = np.clip(self.b_in, -weight_clip, weight_clip)
+        self.b_exp1 = np.clip(self.b_exp1, -weight_clip, weight_clip)
+        self.b_bottle = np.clip(self.b_bottle, -weight_clip, weight_clip)
+        self.b_cont1 = np.clip(self.b_cont1, -weight_clip, weight_clip)
+        self.b_cont2 = np.clip(self.b_cont2, -weight_clip, weight_clip)
+        self.b_out = np.clip(self.b_out, -weight_clip, weight_clip)
+        self.b_trap = np.clip(self.b_trap, -weight_clip, weight_clip)
+        self.b_diverge_dir = np.clip(self.b_diverge_dir, -weight_clip, weight_clip)
         
         # Update bit importance based on input layer gradients
         # CRITICAL FIX: Faster update rate (0.2 vs 0.05) for meaningful differentiation
@@ -965,6 +1034,28 @@ class MLClauseLearner:
         print(f"Escape patterns: {stats['escape_patterns_count']}")
         if hasattr(self, 'bit_good_count'):
             print(f"Good/Bad tracking: {stats['total_good_bits_tracked']:.0f} / {stats['total_bad_bits_tracked']:.0f}")
+        
+        # NEW: Print bit-N correlation summary
+        print("-"*60)
+        print("BIT-N CORRELATION (how bits affect product relative to N):")
+        corr_summary = self.get_correlation_summary()
+        print(f"  Observations: above_N={corr_summary['count_above_N']}, below_N={corr_summary['count_below_N']}")
+        print(f"  Total flip observations: {corr_summary['total_flip_observations']:.0f}")
+        if corr_summary['count_above_N'] > 10 and corr_summary['count_below_N'] > 10:
+            print(f"  Strongest POSITIVE (bit=1 → product>N):")
+            for bit_idx, corr in corr_summary['strongest_positive'][:3]:
+                if abs(corr) > 0.01:
+                    print(f"    Bit {bit_idx}: correlation={corr:.3f}")
+            print(f"  Strongest NEGATIVE (bit=1 → product<N):")
+            for bit_idx, corr in corr_summary['strongest_negative'][:3]:
+                if abs(corr) > 0.01:
+                    print(f"    Bit {bit_idx}: correlation={corr:.3f}")
+            print(f"  Highest IMPACT bits (affect product magnitude):")
+            for bit_idx, impact in corr_summary['highest_impact'][:5]:
+                if impact > 1.0:
+                    print(f"    Bit {bit_idx}: impact={impact:.2f}")
+        else:
+            print("  ⚠️  Still gathering correlation data...")
         print("="*60 + "\n")
     
     def predict_quality(self, config: np.ndarray, p: int = None, q: int = None) -> float:
@@ -1283,6 +1374,187 @@ class MLClauseLearner:
             candidate[i] = 1 - candidate[i]
         
         return candidate.astype(int)
+    
+    def learn_correlation_from_observation(self, config, product: int, diff: int):
+        """
+        Learn bit-N correlations from observing a configuration.
+        
+        This learns WITHOUT flipping - just from observing which bit patterns
+        correlate with being above/below N.
+        
+        Key insight: Track which bits are typically 1 when product > N vs product < N.
+        This tells us which bits to flip to move toward N.
+        """
+        if self.N is None or product is None:
+            return
+        
+        # Ensure config is numpy array
+        if not isinstance(config, np.ndarray):
+            config = np.array(config)
+        
+        num_bits = min(len(config), len(self.bit_when_above_N))
+        bits = config[:num_bits].astype(float)
+        
+        # Determine if above or below N
+        signed_error = product - self.N
+        
+        if signed_error > 0:
+            # Product > N: track which bits are 1 in this "too high" state
+            self.count_above_N += 1
+            alpha = 1.0 / self.count_above_N  # Running average
+            self.bit_when_above_N[:num_bits] = (1 - alpha) * self.bit_when_above_N[:num_bits] + alpha * bits
+        elif signed_error < 0:
+            # Product < N: track which bits are 1 in this "too low" state
+            self.count_below_N += 1
+            alpha = 1.0 / self.count_below_N
+            self.bit_when_below_N[:num_bits] = (1 - alpha) * self.bit_when_below_N[:num_bits] + alpha * bits
+        
+        # Update bit-N correlation based on this observation
+        # Positive correlation = bit=1 associated with product > N (too high)
+        # Negative correlation = bit=1 associated with product < N (too low)
+        if self.count_above_N > 10 and self.count_below_N > 10:
+            # We have enough data to estimate correlation
+            # Correlation = (avg when above) - (avg when below)
+            # If positive: bit being 1 correlates with being above N -> flip to 0 when above
+            # If negative: bit being 1 correlates with being below N -> flip to 1 when below
+            correlation_diff = self.bit_when_above_N[:num_bits] - self.bit_when_below_N[:num_bits]
+            
+            # EMA update
+            alpha = 0.05
+            self.bit_n_correlation[:num_bits] = (1 - alpha) * self.bit_n_correlation[:num_bits] + alpha * correlation_diff
+        
+        # Track transition if we have previous state
+        if self.prev_config is not None and self.prev_diff is not None:
+            # Find which bits changed
+            prev_len = min(len(self.prev_config), num_bits)
+            changed = np.where(config[:prev_len] != self.prev_config[:prev_len])[0]
+            for bit_idx in changed:
+                old_val = int(self.prev_config[bit_idx])
+                new_val = int(config[bit_idx])
+                # Learn from this implicit "flip"
+                self._learn_flip_correlation(
+                    bit_idx, old_val, new_val,
+                    self.prev_diff, diff,
+                    self.prev_product, product
+                )
+        
+        # Save current state for next observation
+        self.prev_config = config.copy()
+        self.prev_product = product
+        self.prev_diff = diff
+    
+    def _learn_flip_correlation(self, bit_idx: int, old_val: int, new_val: int,
+                                 old_diff: int, new_diff: int,
+                                 old_product: int, new_product: int):
+        """Learn correlation from observing a flip's effect."""
+        if bit_idx >= len(self.bit_correlation_0to1):
+            return
+            
+        # Calculate signed impact using bit-length for huge integers
+        old_bits = old_diff.bit_length() if isinstance(old_diff, int) and old_diff > 0 else 0
+        new_bits = new_diff.bit_length() if isinstance(new_diff, int) and new_diff > 0 else 0
+        signed_impact = float(new_bits - old_bits)  # Positive = got worse
+        
+        # Track directional correlation statistics
+        if old_val == 0 and new_val == 1:
+            stats = self.bit_correlation_0to1[bit_idx]
+        else:
+            stats = self.bit_correlation_1to0[bit_idx]
+        
+        stats[0] += signed_impact           # sum
+        stats[1] += signed_impact ** 2      # sum of squares
+        stats[2] += 1                        # count
+        
+        # Update bit impact magnitude
+        abs_impact = abs(signed_impact)
+        if abs_impact > 0:
+            alpha = 0.1
+            self.bit_impact_magnitude[bit_idx] = (1 - alpha) * self.bit_impact_magnitude[bit_idx] + alpha * abs_impact
+        
+        # Track signed relationship with N if we have product info
+        if old_product is not None and new_product is not None and self.N is not None:
+            error_change = new_product - old_product
+            if isinstance(error_change, int) and abs(error_change) > 0:
+                error_change_bits = error_change.bit_length() * (1 if error_change > 0 else -1)
+            else:
+                error_change_bits = 0
+            
+            if old_val == 0 and new_val == 1:
+                correlation_update = error_change_bits
+            else:
+                correlation_update = -error_change_bits
+            
+            alpha = 0.1
+            self.bit_n_correlation_count[bit_idx] += 1
+            weight = min(1.0, 1.0 / (1 + self.bit_n_correlation_count[bit_idx] * 0.01))
+            self.bit_n_correlation[bit_idx] = (1 - alpha * weight) * self.bit_n_correlation[bit_idx] + alpha * weight * correlation_update
+    
+    def get_correlation_based_flip_score(self, bit_idx: int, current_val: int,
+                                          current_product: int = None) -> float:
+        """
+        Get flip score based on learned bit-N correlations.
+        
+        Uses correlation with N to suggest which way to flip:
+        - If product > N and bit has positive correlation: flip to 0 (reduce product)
+        - If product < N and bit has negative correlation: flip to 1 (increase product)
+        """
+        if bit_idx >= len(self.bit_n_correlation):
+            return 0.0
+        
+        correlation = self.bit_n_correlation[bit_idx]
+        impact_magnitude = self.bit_impact_magnitude[bit_idx]
+        
+        score = 0.0
+        
+        if current_product is not None and self.N is not None:
+            signed_error = current_product - self.N
+            
+            if signed_error > 0:
+                # Product too high - want to reduce it
+                if current_val == 1 and correlation > 0:
+                    score = correlation * impact_magnitude * 10.0
+                elif current_val == 0 and correlation < 0:
+                    score = -abs(correlation) * impact_magnitude * 5.0
+            elif signed_error < 0:
+                # Product too low - want to increase it
+                if current_val == 0 and correlation < 0:
+                    score = abs(correlation) * impact_magnitude * 10.0
+                elif current_val == 1 and correlation > 0:
+                    score = -correlation * impact_magnitude * 5.0
+        else:
+            # Use directional statistics from flip history
+            if current_val == 0:
+                stats = self.bit_correlation_0to1[bit_idx]
+            else:
+                stats = self.bit_correlation_1to0[bit_idx]
+            
+            count = stats[2]
+            if count > 5:
+                mean_impact = stats[0] / count
+                score = -mean_impact * 5.0
+        
+        return score
+    
+    def get_correlation_summary(self) -> dict:
+        """Get summary of learned bit-N correlations for debugging/monitoring."""
+        num_bits = len(self.bit_n_correlation)
+        
+        sorted_by_corr = np.argsort(self.bit_n_correlation)
+        strongest_positive = sorted_by_corr[-5:][::-1]
+        strongest_negative = sorted_by_corr[:5]
+        
+        sorted_by_impact = np.argsort(self.bit_impact_magnitude)[::-1]
+        highest_impact = sorted_by_impact[:10]
+        
+        return {
+            'strongest_positive': [(int(i), float(self.bit_n_correlation[i])) for i in strongest_positive],
+            'strongest_negative': [(int(i), float(self.bit_n_correlation[i])) for i in strongest_negative],
+            'highest_impact': [(int(i), float(self.bit_impact_magnitude[i])) for i in highest_impact],
+            'count_above_N': self.count_above_N,
+            'count_below_N': self.count_below_N,
+            'total_flip_observations': sum(self.bit_correlation_0to1[:, 2]) + sum(self.bit_correlation_1to0[:, 2])
+        }
+
 import math
 
 # Increase limit for large integer string conversion
@@ -1466,8 +1738,21 @@ class IncrementalQuantumAnnealing:
     def __init__(self, N: int, num_triangle_pairs: int = 20, 
                  log_file: str = "triangle_qubit_states.log",
                  initial_temp: float = 1000.0,
-                 final_temp: float = 0.01):
+                 final_temp: float = 0.01,
+                 state_file: str = None):
+        """
+        Initialize annealing solver.
+        
+        Args:
+            N: Number to factor
+            num_triangle_pairs: Number of triangle qubit pairs
+            log_file: Log file for triangle states
+            initial_temp: Starting temperature
+            final_temp: Ending temperature
+            state_file: If provided, load existing state from this file BEFORE initializing
+        """
         self.N = N
+        self._state_file = state_file  # Store for later use
         
         # NEW ENCODING: Need pairs for BOTH p and q independently
         # Each factor needs ceil(log2(sqrt(N))) bits
@@ -1591,6 +1876,198 @@ class IncrementalQuantumAnnealing:
         
         # Derive mathematical constraints from N automatically
         self.derived_constraints = self._derive_constraints_from_N()
+        
+        # =====================================================================
+        # LOAD EXISTING STATE IF PROVIDED (priority over fresh init)
+        # =====================================================================
+        if state_file and os.path.exists(state_file):
+            self._load_state_on_init(state_file)
+    
+    def _load_state_on_init(self, state_file: str):
+        """
+        Load existing state during initialization.
+        This ensures we don't lose learned data when re-initializing.
+        """
+        import json
+        try:
+            with open(state_file, 'r') as f:
+                saved_state = json.load(f)
+            
+            # Verify it's for the same problem
+            saved_N = saved_state.get('N')
+            if isinstance(saved_N, str):
+                saved_N = int(saved_N)
+            
+            if saved_N != self.N:
+                print(f"[Init State] State file is for different N, ignoring")
+                return
+            
+            print(f"\n{'='*60}")
+            print(f"LOADING EXISTING STATE ON INIT")
+            print(f"{'='*60}")
+            
+            # Restore learning data structures
+            if 'learned_clauses' in saved_state and saved_state['learned_clauses']:
+                restored_clauses = []
+                for item in saved_state['learned_clauses']:
+                    if isinstance(item, (list, tuple)) and len(item) == 3:
+                        clause, energy, diff = item
+                        clause_tuple = tuple(clause) if isinstance(clause, list) else clause
+                        restored_clauses.append((clause_tuple, energy, diff))
+                self.learned_clauses = restored_clauses
+                print(f"  Restored {len(self.learned_clauses)} learned clauses")
+            
+            if 'best_partial_solutions' in saved_state:
+                self.best_partial_solutions = saved_state['best_partial_solutions']
+                print(f"  Restored {len(self.best_partial_solutions)} partial solutions")
+            
+            if 'good_bit_patterns' in saved_state:
+                self.good_bit_patterns = {
+                    int(k): {int(ik): iv for ik, iv in v.items()}
+                    for k, v in saved_state['good_bit_patterns'].items()
+                }
+                print(f"  Restored {len(self.good_bit_patterns)} good bit patterns")
+            
+            if 'bad_bit_combos' in saved_state and saved_state['bad_bit_combos']:
+                self.bad_bit_combos = {}
+                for item in saved_state['bad_bit_combos']:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        key, val = item
+                        self.bad_bit_combos[tuple(key)] = val
+                print(f"  Restored {len(self.bad_bit_combos)} bad bit combos")
+            
+            if 'nogood_patterns' in saved_state:
+                restored_nogoods = []
+                for item in saved_state['nogood_patterns']:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        nogood_dict, diff = item
+                        if isinstance(nogood_dict, dict):
+                            nogood_dict = {int(k): v for k, v in nogood_dict.items()}
+                        restored_nogoods.append((nogood_dict, diff))
+                self.nogood_patterns = deque(restored_nogoods, maxlen=1000)
+                print(f"  Restored {len(self.nogood_patterns)} nogood patterns")
+            
+            if 'tabu_list' in saved_state:
+                self.tabu_list = deque([tuple(t) for t in saved_state['tabu_list']], maxlen=100)
+                print(f"  Restored {len(self.tabu_list)} tabu entries")
+            
+            if 'elite_population' in saved_state:
+                self.elite_population = [
+                    {'config': np.array(e['config']), 'p': e['p'], 'q': e['q'], 
+                     'diff': e['diff'], 'energy': e['energy']} 
+                    for e in saved_state['elite_population']
+                ]
+                print(f"  Restored {len(self.elite_population)} elite solutions")
+            
+            # Restore best_diff_seen
+            if 'best_diff_seen' in saved_state and saved_state['best_diff_seen'] is not None:
+                self.best_diff_seen = saved_state['best_diff_seen']
+                print(f"  Restored best_diff_seen: {self.best_diff_seen}")
+            elif self.elite_population:
+                self.elite_population.sort(key=lambda x: x['diff'])
+                self.best_diff_seen = self.elite_population[0]['diff']
+            
+            # Update adaptive thresholds
+            if self.best_diff_seen != float('inf'):
+                self.very_bad_threshold = max(100, self.best_diff_seen * 10)
+                self.clause_threshold = max(50, self.best_diff_seen * 5)
+            
+            # Restore neural network state
+            if 'neural_network' in saved_state and hasattr(self, 'ml_clause_learner'):
+                nn_state = saved_state['neural_network']
+                nn = self.ml_clause_learner
+                try:
+                    if 'W_in' in nn_state:
+                        # HOURGLASS FORMAT
+                        nn.W_in = np.array(nn_state['W_in'])
+                        nn.b_in = np.array(nn_state['b_in'])
+                        nn.W_exp1 = np.array(nn_state['W_exp1'])
+                        nn.b_exp1 = np.array(nn_state['b_exp1'])
+                        nn.W_bottle = np.array(nn_state['W_bottle'])
+                        nn.b_bottle = np.array(nn_state['b_bottle'])
+                        nn.W_cont1 = np.array(nn_state['W_cont1'])
+                        nn.b_cont1 = np.array(nn_state['b_cont1'])
+                        nn.W_cont2 = np.array(nn_state['W_cont2'])
+                        nn.b_cont2 = np.array(nn_state['b_cont2'])
+                        nn.W_skip1 = np.array(nn_state['W_skip1'])
+                        nn.W_skip2 = np.array(nn_state['W_skip2'])
+                        nn.W_out = np.array(nn_state['W_out'])
+                        nn.b_out = np.array(nn_state['b_out'])
+                        if 'W_trap' in nn_state:
+                            nn.W_trap = np.array(nn_state['W_trap'])
+                            nn.b_trap = np.array(nn_state['b_trap'])
+                        if 'W_diverge_dir' in nn_state:
+                            nn.W_diverge_dir = np.array(nn_state['W_diverge_dir'])
+                            nn.b_diverge_dir = np.array(nn_state['b_diverge_dir'])
+                        # Restore momentum buffers
+                        if 'v_W_in' in nn_state:
+                            nn.v_W_in = np.array(nn_state['v_W_in'])
+                            nn.v_W_exp1 = np.array(nn_state['v_W_exp1'])
+                            nn.v_W_bottle = np.array(nn_state['v_W_bottle'])
+                            nn.v_W_cont1 = np.array(nn_state['v_W_cont1'])
+                            nn.v_W_cont2 = np.array(nn_state['v_W_cont2'])
+                            nn.v_W_out = np.array(nn_state['v_W_out'])
+                        if 'trap_encounters' in nn_state:
+                            nn.trap_encounters = nn_state['trap_encounters']
+                            nn.trap_escapes = nn_state['trap_escapes']
+                        print(f"  [NEURAL] Restored HOURGLASS network weights")
+                    
+                    # Restore learned importance
+                    if 'bit_importance' in nn_state:
+                        nn.bit_importance = np.array(nn_state['bit_importance'])
+                    
+                    # Restore training stats
+                    nn.num_samples = nn_state.get('num_samples', 0)
+                    nn.diff_mean = nn_state.get('diff_mean', 0.0)
+                    nn.diff_std = nn_state.get('diff_std', 1.0)
+                    nn.lr = nn_state.get('lr', 0.001)
+                    
+                    # Restore best patterns
+                    nn.best_patterns = [(np.array(p), d) for p, d in nn_state.get('best_patterns', [])]
+                    
+                    # Restore replay buffer sample
+                    if 'replay_buffer_sample' in nn_state:
+                        nn.replay_buffer = []
+                        for b, nd, d in nn_state['replay_buffer_sample']:
+                            nn.replay_buffer.append((np.array(b), nd, d, None, None, 0.0, 0.0))
+                    
+                    # Restore direct correlation tracking
+                    if nn_state.get('bit_good_count') is not None:
+                        nn.bit_good_count = np.array(nn_state['bit_good_count'])
+                        nn.bit_bad_count = np.array(nn_state['bit_bad_count'])
+                        nn.good_threshold = nn_state.get('good_threshold')
+                        nn.bad_threshold = nn_state.get('bad_threshold')
+                    
+                    # Restore bit-N correlation tracking
+                    if nn_state.get('bit_n_correlation') is not None:
+                        nn.bit_n_correlation = np.array(nn_state['bit_n_correlation'])
+                    if nn_state.get('bit_when_above_N') is not None:
+                        nn.bit_when_above_N = np.array(nn_state['bit_when_above_N'])
+                        nn.bit_when_below_N = np.array(nn_state['bit_when_below_N'])
+                        nn.count_above_N = nn_state.get('count_above_N', 0)
+                        nn.count_below_N = nn_state.get('count_below_N', 0)
+                    if nn_state.get('bit_impact_magnitude') is not None:
+                        nn.bit_impact_magnitude = np.array(nn_state['bit_impact_magnitude'])
+                    if nn_state.get('bit_correlation_0to1') is not None:
+                        nn.bit_correlation_0to1 = np.array(nn_state['bit_correlation_0to1'])
+                        nn.bit_correlation_1to0 = np.array(nn_state['bit_correlation_1to0'])
+                    
+                    # Restore escape patterns
+                    if nn_state.get('escape_patterns'):
+                        nn.escape_patterns = [(np.array(b), p, q, d) for b, p, q, d in nn_state['escape_patterns']]
+                    
+                    # Restore loss history
+                    if nn_state.get('loss_history'):
+                        nn.loss_history = list(nn_state['loss_history'])
+                    
+                    print(f"  [NEURAL] Restored {nn.num_samples} training samples, {len(nn.best_patterns)} patterns")
+                except Exception as e:
+                    print(f"  [NEURAL] Warning: Could not fully restore neural state: {e}")
+            
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"[Init State] Could not load state: {e}")
     
     def _derive_constraints_from_N(self) -> dict:
         """
@@ -1925,6 +2402,10 @@ class IncrementalQuantumAnnealing:
         # ML CLAUSE LEARNING: Train neural network with TRAP AWARENESS
         # Pass p and q so the network can detect and learn to escape sqrt(N) trap
         self.ml_clause_learner.learn(config, diff, p=p, q=q)
+        
+        # NEW: Learn bit-N correlations from this observation
+        # This tracks how each bit's value correlates with the product relative to N
+        self.ml_clause_learner.learn_correlation_from_observation(config, product, diff)
         
         # Log trap status periodically
         if self.ml_clause_learner.trap_encounters > 0 and self.ml_clause_learner.trap_encounters % 10 == 0:
@@ -2350,12 +2831,16 @@ class IncrementalQuantumAnnealing:
     # ========== ACTION-VALUE LEARNING (Q-Learning style) ==========
     
     def learn_from_flip(self, bit_idx: int, old_val: int, new_val: int, 
-                         old_diff: int, new_diff: int, config: np.ndarray):
+                         old_diff: int, new_diff: int, config: np.ndarray,
+                         old_product: int = None, new_product: int = None):
         """
-        Learn from a bit flip: update Q-values for this action.
+        Learn from a bit flip: update Q-values AND correlation statistics.
         
-        This is where the ML "learns which bit flips to make" based on results.
-        Key insight: reward = improvement, punishment = getting worse.
+        This learns BOTH:
+        1. Which flips improve (Q-learning for actions)
+        2. How each bit correlates with the actual value relative to N (not just good/bad)
+        
+        Key insight: Learn the signed correlation - does this bit push toward or away from N?
         """
         # Calculate reward based on improvement
         # USE BIT LENGTH DIFFERENCE to avoid overflow with huge RSA integers
@@ -2404,6 +2889,64 @@ class IncrementalQuantumAnnealing:
                 # Keep top by improvement
                 self.successful_sequences.sort(key=lambda x: -x[1])
                 self.successful_sequences = self.successful_sequences[:250]
+        
+        # =====================================================================
+        # BIT-N CORRELATION LEARNING (actual impact on p*q relative to N)
+        # =====================================================================
+        if bit_idx < len(self.bit_correlation_0to1):
+            # Calculate signed impact: positive = moved away from N, negative = moved toward N
+            # Use bit-length for magnitude to handle huge integers
+            signed_impact = float(new_bits - old_bits)  # Positive = got worse (farther from N)
+            
+            # Track directional correlation statistics
+            if old_val == 0 and new_val == 1:
+                # 0->1 flip: track impact
+                stats = self.bit_correlation_0to1[bit_idx]
+                stats[0] += signed_impact           # sum
+                stats[1] += signed_impact ** 2      # sum of squares
+                stats[2] += 1                        # count
+            else:
+                # 1->0 flip: track impact  
+                stats = self.bit_correlation_1to0[bit_idx]
+                stats[0] += signed_impact
+                stats[1] += signed_impact ** 2
+                stats[2] += 1
+            
+            # Update bit impact magnitude (how much this bit affects the product)
+            abs_impact = abs(signed_impact)
+            if abs_impact > 0:
+                # Exponential moving average of absolute impact
+                alpha = 0.1
+                self.bit_impact_magnitude[bit_idx] = (1 - alpha) * self.bit_impact_magnitude[bit_idx] + alpha * abs_impact
+            
+            # If we have product information, track signed relationship with N
+            if old_product is not None and new_product is not None and self.N is not None:
+                # Calculate how the flip changed the signed error (product - N)
+                old_signed_error = old_product - self.N
+                new_signed_error = new_product - self.N
+                
+                # Key insight: how did this flip affect the signed error?
+                # If flipping 0->1 made (p*q - N) more positive: bit contributes positively to product
+                # If flipping 0->1 made (p*q - N) more negative: bit contributes negatively to product
+                error_change = new_signed_error - old_signed_error  # In bit-length terms
+                if isinstance(error_change, int) and abs(error_change) > 0:
+                    error_change_bits = error_change.bit_length() * (1 if error_change > 0 else -1)
+                else:
+                    error_change_bits = 0
+                
+                # Update bit-N correlation: does this bit being 1 push product UP or DOWN?
+                if old_val == 0 and new_val == 1:
+                    # Setting bit to 1 caused error_change - this tells us the bit's "weight"
+                    correlation_update = error_change_bits
+                else:
+                    # Setting bit to 0 caused error_change - opposite interpretation
+                    correlation_update = -error_change_bits
+                
+                # EMA update of bit-N correlation
+                alpha = 0.1
+                self.bit_n_correlation_count[bit_idx] += 1
+                weight = min(1.0, 1.0 / (1 + self.bit_n_correlation_count[bit_idx] * 0.01))  # Decay learning rate
+                self.bit_n_correlation[bit_idx] = (1 - alpha * weight) * self.bit_n_correlation[bit_idx] + alpha * weight * correlation_update
     
     def _get_state_features(self, config: np.ndarray) -> tuple:
         """Extract key features from state for state-action learning."""
@@ -2426,73 +2969,6 @@ class IncrementalQuantumAnnealing:
                 features.append(int(config[self.pairs[pair_idx].source_qubit]))
         
         return tuple(features)
-    
-    def get_learned_flip_score(self, bit_idx: int, current_val: int) -> float:
-        """
-        Get ML-learned score for flipping this bit.
-        
-        Higher score = historically this flip has led to improvement.
-        This is how the ML "knows which bit flips to make".
-        """
-        # Direction we'd flip to
-        new_val = 1 - current_val
-        direction = f"{current_val}->{new_val}"
-        action_key = (bit_idx, direction)
-        
-        score = 0.0
-        
-        # 1. Global reward from all times we made this flip
-        if action_key in self.flip_rewards:
-            global_reward = self.flip_rewards[action_key]
-            count = self.flip_counts.get(action_key, 1)
-            # Weight by count (more data = more confidence)
-            confidence = min(1.0, count / 10.0)  # Max confidence at 10+ samples
-            score += global_reward * confidence * 10.0
-        
-        # 2. Penalty for opposite direction being good
-        opposite_key = (bit_idx, f"{new_val}->{current_val}")
-        if opposite_key in self.flip_rewards:
-            opposite_reward = self.flip_rewards[opposite_key]
-            if opposite_reward > 0:  # If opposite direction was good, penalize this
-                score -= opposite_reward * 5.0
-        
-        # 3. Bonus from successful sequences that include this bit
-        for seq, improvement in self.successful_sequences[-50:]:  # Check recent sequences
-            if bit_idx in seq:
-                score += improvement * 0.1  # Small bonus for being in good sequences
-        
-        return score
-    
-    def get_best_learned_flips(self, config: np.ndarray, n: int = 5) -> List[int]:
-        """
-        Get the top N bits to flip based on ML learning.
-        
-        This is the key ML method: tells us which bits to flip based on
-        accumulated experience from past attempts.
-        """
-        # Score all source qubits
-        scores = []
-        for pair in self.pairs:
-            bit_idx = pair.source_qubit
-            current_val = int(config[bit_idx])
-            
-            # Get learned score
-            learned_score = self.get_learned_flip_score(bit_idx, current_val)
-            
-            # Also factor in current state-action value
-            state_features = self._get_state_features(config)
-            state_hash = hash(state_features)
-            state_action_key = (state_hash, bit_idx)
-            state_q = self.state_action_values.get(state_action_key, 0.0)
-            
-            total_score = learned_score + state_q
-            scores.append((bit_idx, total_score))
-        
-        # Sort by score descending (best flips first)
-        scores.sort(key=lambda x: -x[1])
-        
-        # Return top N bit indices
-        return [s[0] for s in scores[:n]]
 
     def local_search(self, config: np.ndarray) -> Tuple[np.ndarray, int, int]:
         """
@@ -4625,6 +5101,20 @@ class IncrementalQuantumAnnealing:
                             if nn_state.get('loss_history'):
                                 nn.loss_history = list(nn_state['loss_history'])
                             
+                            # NEW: Restore bit-N correlation tracking
+                            if nn_state.get('bit_n_correlation') is not None:
+                                nn.bit_n_correlation = np.array(nn_state['bit_n_correlation'])
+                            if nn_state.get('bit_when_above_N') is not None:
+                                nn.bit_when_above_N = np.array(nn_state['bit_when_above_N'])
+                                nn.bit_when_below_N = np.array(nn_state['bit_when_below_N'])
+                                nn.count_above_N = nn_state.get('count_above_N', 0)
+                                nn.count_below_N = nn_state.get('count_below_N', 0)
+                            if nn_state.get('bit_impact_magnitude') is not None:
+                                nn.bit_impact_magnitude = np.array(nn_state['bit_impact_magnitude'])
+                            if nn_state.get('bit_correlation_0to1') is not None:
+                                nn.bit_correlation_0to1 = np.array(nn_state['bit_correlation_0to1'])
+                                nn.bit_correlation_1to0 = np.array(nn_state['bit_correlation_1to0'])
+                            
                             print(f"  [NEURAL] Restored {nn.num_samples} training samples, {len(nn.best_patterns)} patterns")
                         except Exception as e:
                             print(f"  [NEURAL] Warning: Could not fully restore neural state: {e}")
@@ -4712,7 +5202,16 @@ class IncrementalQuantumAnnealing:
                     # NEW: Escape patterns
                     'escape_patterns': [(b.tolist(), int(p), int(q), int(d)) for b, p, q, d in nn.escape_patterns[:50]] if hasattr(nn, 'escape_patterns') else [],
                     # NEW: Loss history (last 100)
-                    'loss_history': nn.loss_history[-100:] if hasattr(nn, 'loss_history') else []
+                    'loss_history': nn.loss_history[-100:] if hasattr(nn, 'loss_history') else [],
+                    # NEW: Bit-N correlation tracking
+                    'bit_n_correlation': nn.bit_n_correlation.tolist() if hasattr(nn, 'bit_n_correlation') else None,
+                    'bit_when_above_N': nn.bit_when_above_N.tolist() if hasattr(nn, 'bit_when_above_N') else None,
+                    'bit_when_below_N': nn.bit_when_below_N.tolist() if hasattr(nn, 'bit_when_below_N') else None,
+                    'count_above_N': nn.count_above_N if hasattr(nn, 'count_above_N') else 0,
+                    'count_below_N': nn.count_below_N if hasattr(nn, 'count_below_N') else 0,
+                    'bit_impact_magnitude': nn.bit_impact_magnitude.tolist() if hasattr(nn, 'bit_impact_magnitude') else None,
+                    'bit_correlation_0to1': nn.bit_correlation_0to1.tolist() if hasattr(nn, 'bit_correlation_0to1') else None,
+                    'bit_correlation_1to0': nn.bit_correlation_1to0.tolist() if hasattr(nn, 'bit_correlation_1to0') else None
                 }
                 print(f"  [Neural] Saved HOURGLASS network state ({nn.num_samples} samples, {nn.trap_escapes}/{nn.trap_encounters} escapes)")
             
@@ -5648,4 +6147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
