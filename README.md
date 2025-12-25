@@ -46,21 +46,6 @@ The system learns from every factorization attempt, building up knowledge about 
 - Predicts product error direction (too high/too low)
 - Tracks bit-N correlations for smarter suggestions
 
-## 📦 Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/quantum-annealing-factorization.git
-cd quantum-annealing-factorization
-
-# Install dependencies
-pip install numpy
-
-# Optional: Install tkinter for GUI (usually included with Python)
-# Ubuntu/Debian:
-sudo apt-get install python3-tk
-```
-
 ## 🚀 Usage
 
 ### GUI Mode (Recommended)
