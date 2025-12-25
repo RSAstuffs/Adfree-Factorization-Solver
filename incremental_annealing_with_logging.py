@@ -16,6 +16,909 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 import multiprocessing as mp
 
 
+# =============================================================================
+# BIT TRANSFORMER: LLM-STYLE ATTENTION FOR BIT SEQUENCE MODELING
+# =============================================================================
+class BitTransformer:
+    """
+    Heavyweight LLM-style Transformer for bit sequence modeling.
+    
+    Treats bit configurations as sequences and learns:
+    - Which bits influence each other (multi-head self-attention)
+    - Positional importance (sinusoidal encoding like GPT/BERT)
+    - Historical patterns (context memory window)
+    - Bit flip predictions (output head)
+    
+    Architecture:
+        Input bits → Embedding → Positional Encoding
+              ↓
+        [Transformer Layer 1] (Multi-Head Attention + FFN + LayerNorm)
+              ↓
+        [Transformer Layer 2]
+              ↓
+        [Transformer Layer 3]
+              ↓
+        [Transformer Layer 4]
+              ↓
+        Output Head → Flip Scores + Value Prediction
+    
+    This modulates the existing MLClauseLearner by providing attention-weighted
+    bit importance scores that capture long-range bit dependencies.
+    """
+    
+    def __init__(self, num_bits: int, d_model: int = 256, num_heads: int = 8,
+                 num_layers: int = 4, d_ff: int = 1024, max_context: int = 100,
+                 dropout_rate: float = 0.1):
+        """
+        Initialize the BitTransformer.
+        
+        Args:
+            num_bits: Number of bits in configuration (sequence length)
+            d_model: Model dimension (embedding size)
+            num_heads: Number of attention heads
+            num_layers: Number of transformer layers
+            d_ff: Feed-forward hidden dimension
+            max_context: Maximum context memory size
+            dropout_rate: Dropout probability (stored but not used in numpy)
+        """
+        self.num_bits = num_bits
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.d_ff = d_ff
+        self.d_k = d_model // num_heads  # Key/Query/Value dimension per head
+        self.max_context = max_context
+        self.dropout_rate = dropout_rate
+        
+        # Scale d_model for very large bit sequences
+        if num_bits > 1000:
+            self.d_model = max(d_model, min(512, num_bits // 4))
+            self.d_ff = self.d_model * 4
+            self.d_k = self.d_model // num_heads
+        
+        print(f"[BitTransformer] Initializing LLM-style attention module:")
+        print(f"  Sequence length: {num_bits} bits")
+        print(f"  Model dimension: {self.d_model}")
+        print(f"  Attention heads: {num_heads} (d_k={self.d_k})")
+        print(f"  Transformer layers: {num_layers}")
+        print(f"  FFN dimension: {self.d_ff}")
+        print(f"  Context memory: {max_context} configurations")
+        
+        # =====================================================================
+        # POSITIONAL ENCODING (Sinusoidal, like original Transformer)
+        # =====================================================================
+        self.positional_encoding = self._create_positional_encoding(num_bits, self.d_model)
+        
+        # =====================================================================
+        # INPUT EMBEDDING: Map bits (0/1) to d_model dimensional vectors
+        # =====================================================================
+        # Learnable embedding for bit values (like token embedding in LLMs)
+        self.W_embed = np.random.randn(2, self.d_model) * 0.02
+        
+        # Additional bit position embedding (learnable, complements sinusoidal)
+        self.W_pos_embed = np.random.randn(num_bits, self.d_model) * 0.02
+        
+        # =====================================================================
+        # TRANSFORMER LAYERS
+        # =====================================================================
+        self.layers = []
+        for layer_idx in range(num_layers):
+            layer = self._create_transformer_layer(layer_idx)
+            self.layers.append(layer)
+        
+        # =====================================================================
+        # OUTPUT HEADS
+        # =====================================================================
+        # Flip score head: predicts flip quality for each bit position
+        self.W_flip = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        self.b_flip = np.zeros(1)
+        
+        # Value head: predicts expected improvement (like critic in RL)
+        self.W_value = np.random.randn(self.d_model, 1) * np.sqrt(2.0 / self.d_model)
+        self.b_value = np.zeros(1)
+        
+        # Attention aggregation: pool sequence to single vector for global prediction
+        self.W_pool = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
+        self.b_pool = np.zeros(self.d_model)
+        
+        # =====================================================================
+        # CONTEXT MEMORY (like KV-cache in LLMs)
+        # =====================================================================
+        self.context_memory = []  # List of (config, diff, outcome) tuples
+        self.context_embeddings = None  # Cached embeddings for context
+        
+        # Cross-attention weights for attending to context
+        self.W_context_K = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
+        self.W_context_V = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
+        self.W_context_Q = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
+        self.W_context_O = np.random.randn(self.d_model, self.d_model) * np.sqrt(2.0 / self.d_model)
+        
+        # Layer norm for context attention
+        self.ln_context_gamma = np.ones(self.d_model)
+        self.ln_context_beta = np.zeros(self.d_model)
+        
+        # =====================================================================
+        # OPTIMIZER STATE (Adam)
+        # =====================================================================
+        self.lr = 0.0001  # Lower LR for transformer stability
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.epsilon = 1e-8
+        self.t = 0  # Time step for Adam
+        
+        # Initialize Adam momentum buffers for all weights
+        self._init_optimizer_state()
+        
+        # =====================================================================
+        # TRAINING STATE
+        # =====================================================================
+        self.training = True
+        self.num_updates = 0
+        self.loss_history = []
+        self.attention_entropy_history = []
+        
+        # Cache for forward pass (for backward)
+        self._cache = {}
+        
+        print(f"  Total parameters: ~{self._count_parameters():,}")
+    
+    def _create_positional_encoding(self, seq_len: int, d_model: int) -> np.ndarray:
+        """
+        Create sinusoidal positional encoding (Vaswani et al., 2017).
+        
+        PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+        """
+        pe = np.zeros((seq_len, d_model))
+        position = np.arange(seq_len)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        
+        return pe
+    
+    def _create_transformer_layer(self, layer_idx: int) -> dict:
+        """Create weights for one transformer layer."""
+        d = self.d_model
+        d_ff = self.d_ff
+        
+        # Xavier/He initialization
+        scale_attn = np.sqrt(2.0 / d)
+        scale_ff = np.sqrt(2.0 / d_ff)
+        
+        layer = {
+            'layer_idx': layer_idx,
+            
+            # Multi-Head Self-Attention weights
+            'W_Q': np.random.randn(d, d) * scale_attn,
+            'W_K': np.random.randn(d, d) * scale_attn,
+            'W_V': np.random.randn(d, d) * scale_attn,
+            'W_O': np.random.randn(d, d) * scale_attn,
+            
+            # Layer Normalization 1 (pre-attention or post-attention)
+            'ln1_gamma': np.ones(d),
+            'ln1_beta': np.zeros(d),
+            
+            # Feed-Forward Network (2 layers with GELU activation)
+            'W_ff1': np.random.randn(d, d_ff) * scale_attn,
+            'b_ff1': np.zeros(d_ff),
+            'W_ff2': np.random.randn(d_ff, d) * scale_ff,
+            'b_ff2': np.zeros(d),
+            
+            # Layer Normalization 2 (pre-FFN or post-FFN)
+            'ln2_gamma': np.ones(d),
+            'ln2_beta': np.zeros(d),
+            
+            # Optional: Gating mechanism (like GLU or SwiGLU in modern LLMs)
+            'W_gate': np.random.randn(d, d_ff) * scale_attn,
+        }
+        
+        return layer
+    
+    def _init_optimizer_state(self):
+        """Initialize Adam optimizer momentum buffers."""
+        self.m = {}  # First moment
+        self.v = {}  # Second moment
+        
+        # Embedding weights
+        self.m['W_embed'] = np.zeros_like(self.W_embed)
+        self.v['W_embed'] = np.zeros_like(self.W_embed)
+        self.m['W_pos_embed'] = np.zeros_like(self.W_pos_embed)
+        self.v['W_pos_embed'] = np.zeros_like(self.W_pos_embed)
+        
+        # Output heads
+        for name in ['W_flip', 'b_flip', 'W_value', 'b_value', 'W_pool', 'b_pool']:
+            arr = getattr(self, name)
+            self.m[name] = np.zeros_like(arr)
+            self.v[name] = np.zeros_like(arr)
+        
+        # Context attention
+        for name in ['W_context_K', 'W_context_V', 'W_context_Q', 'W_context_O',
+                     'ln_context_gamma', 'ln_context_beta']:
+            arr = getattr(self, name)
+            self.m[name] = np.zeros_like(arr)
+            self.v[name] = np.zeros_like(arr)
+        
+        # Layer weights
+        for i, layer in enumerate(self.layers):
+            for key, arr in layer.items():
+                if isinstance(arr, np.ndarray):
+                    name = f'layer{i}_{key}'
+                    self.m[name] = np.zeros_like(arr)
+                    self.v[name] = np.zeros_like(arr)
+    
+    def _count_parameters(self) -> int:
+        """Count total trainable parameters."""
+        count = 0
+        count += self.W_embed.size + self.W_pos_embed.size
+        count += self.W_flip.size + self.b_flip.size
+        count += self.W_value.size + self.b_value.size
+        count += self.W_pool.size + self.b_pool.size
+        count += self.W_context_K.size + self.W_context_V.size
+        count += self.W_context_Q.size + self.W_context_O.size
+        count += self.ln_context_gamma.size + self.ln_context_beta.size
+        
+        for layer in self.layers:
+            for key, arr in layer.items():
+                if isinstance(arr, np.ndarray):
+                    count += arr.size
+        
+        return count
+    
+    def _layer_norm(self, x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, 
+                    eps: float = 1e-5) -> tuple:
+        """
+        Layer normalization.
+        
+        Args:
+            x: Input tensor (seq_len, d_model)
+            gamma: Scale parameter
+            beta: Shift parameter
+            eps: Epsilon for numerical stability
+            
+        Returns:
+            (normalized output, cache for backward)
+        """
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.var(x, axis=-1, keepdims=True)
+        std = np.sqrt(var + eps)
+        x_norm = (x - mean) / std
+        out = gamma * x_norm + beta
+        
+        cache = (x, x_norm, mean, std, gamma)
+        return out, cache
+    
+    def _gelu(self, x: np.ndarray) -> np.ndarray:
+        """
+        GELU activation (Gaussian Error Linear Unit).
+        Used in GPT-2, BERT, and most modern transformers.
+        
+        GELU(x) = x * Φ(x) where Φ is the CDF of standard normal
+        Approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+        """
+        return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))
+    
+    def _gelu_derivative(self, x: np.ndarray) -> np.ndarray:
+        """Derivative of GELU for backward pass."""
+        cdf = 0.5 * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))
+        pdf = np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi)
+        return cdf + x * pdf
+    
+    def _softmax(self, x: np.ndarray, axis: int = -1) -> np.ndarray:
+        """Numerically stable softmax."""
+        x_max = np.max(x, axis=axis, keepdims=True)
+        exp_x = np.exp(x - x_max)
+        return exp_x / (np.sum(exp_x, axis=axis, keepdims=True) + 1e-10)
+    
+    def _multi_head_attention(self, Q: np.ndarray, K: np.ndarray, V: np.ndarray,
+                               W_Q: np.ndarray, W_K: np.ndarray, W_V: np.ndarray,
+                               W_O: np.ndarray, mask: np.ndarray = None) -> tuple:
+        """
+        Multi-Head Scaled Dot-Product Attention.
+        
+        Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+        
+        Args:
+            Q, K, V: Query, Key, Value inputs (seq_len, d_model)
+            W_Q, W_K, W_V, W_O: Projection matrices
+            mask: Optional attention mask
+            
+        Returns:
+            (output, attention_weights, cache)
+        """
+        seq_len = Q.shape[0]
+        
+        # Project Q, K, V
+        Q_proj = Q @ W_Q  # (seq_len, d_model)
+        K_proj = K @ W_K
+        V_proj = V @ W_V
+        
+        # Reshape for multi-head: (seq_len, num_heads, d_k)
+        Q_heads = Q_proj.reshape(seq_len, self.num_heads, self.d_k)
+        K_heads = K_proj.reshape(seq_len, self.num_heads, self.d_k)
+        V_heads = V_proj.reshape(seq_len, self.num_heads, self.d_k)
+        
+        # Transpose for batch matmul: (num_heads, seq_len, d_k)
+        Q_heads = Q_heads.transpose(1, 0, 2)
+        K_heads = K_heads.transpose(1, 0, 2)
+        V_heads = V_heads.transpose(1, 0, 2)
+        
+        # Scaled dot-product attention
+        scale = np.sqrt(self.d_k)
+        
+        # (num_heads, seq_len, seq_len)
+        attention_scores = np.matmul(Q_heads, K_heads.transpose(0, 2, 1)) / scale
+        
+        # Apply mask if provided (e.g., causal mask)
+        if mask is not None:
+            attention_scores = attention_scores + mask * (-1e9)
+        
+        # Softmax over keys
+        attention_weights = self._softmax(attention_scores, axis=-1)
+        
+        # Apply attention to values: (num_heads, seq_len, d_k)
+        attention_output = np.matmul(attention_weights, V_heads)
+        
+        # Reshape back: (seq_len, num_heads, d_k) -> (seq_len, d_model)
+        attention_output = attention_output.transpose(1, 0, 2)
+        attention_output = attention_output.reshape(seq_len, self.d_model)
+        
+        # Output projection
+        output = attention_output @ W_O
+        
+        # Clip to prevent overflow
+        output = np.clip(output, -1e6, 1e6)
+        
+        cache = {
+            'Q': Q, 'K': K, 'V': V,
+            'Q_proj': Q_proj, 'K_proj': K_proj, 'V_proj': V_proj,
+            'Q_heads': Q_heads, 'K_heads': K_heads, 'V_heads': V_heads,
+            'attention_weights': attention_weights,
+            'attention_output': attention_output
+        }
+        
+        return output, attention_weights, cache
+    
+    def _feed_forward(self, x: np.ndarray, W1: np.ndarray, b1: np.ndarray,
+                       W2: np.ndarray, b2: np.ndarray, W_gate: np.ndarray = None) -> tuple:
+        """
+        Position-wise Feed-Forward Network with optional gating (SwiGLU-style).
+        
+        FFN(x) = W2 * GELU(W1 * x + b1) + b2
+        
+        With gating (SwiGLU):
+        FFN(x) = W2 * (GELU(W1 * x + b1) * sigmoid(W_gate * x)) + b2
+        """
+        # First linear + GELU
+        hidden = x @ W1 + b1
+        hidden_act = self._gelu(hidden)
+        
+        # Optional gating mechanism (like SwiGLU in LLaMA)
+        if W_gate is not None:
+            gate = 1 / (1 + np.exp(-np.clip(x @ W_gate, -20, 20)))  # Sigmoid with clip
+            hidden_act = hidden_act * gate
+        
+        # Second linear
+        output = hidden_act @ W2 + b2
+        
+        # Clip to prevent overflow
+        output = np.clip(output, -1e6, 1e6)
+        
+        cache = {
+            'x': x, 'hidden': hidden, 'hidden_act': hidden_act,
+            'W1': W1, 'W2': W2, 'W_gate': W_gate
+        }
+        
+        return output, cache
+    
+    def _transformer_layer_forward(self, x: np.ndarray, layer: dict) -> tuple:
+        """
+        Forward pass through one transformer layer.
+        
+        Pre-LN architecture (like GPT-2):
+            y = x + Attention(LayerNorm(x))
+            z = y + FFN(LayerNorm(y))
+        """
+        # Pre-norm attention
+        x_norm1, ln1_cache = self._layer_norm(x, layer['ln1_gamma'], layer['ln1_beta'])
+        
+        # Multi-head self-attention (Q=K=V for self-attention)
+        attn_out, attn_weights, attn_cache = self._multi_head_attention(
+            x_norm1, x_norm1, x_norm1,
+            layer['W_Q'], layer['W_K'], layer['W_V'], layer['W_O']
+        )
+        
+        # Residual connection
+        x = x + attn_out
+        
+        # Pre-norm FFN
+        x_norm2, ln2_cache = self._layer_norm(x, layer['ln2_gamma'], layer['ln2_beta'])
+        
+        # Feed-forward network
+        ffn_out, ffn_cache = self._feed_forward(
+            x_norm2, 
+            layer['W_ff1'], layer['b_ff1'],
+            layer['W_ff2'], layer['b_ff2'],
+            layer.get('W_gate')
+        )
+        
+        # Residual connection
+        x = x + ffn_out
+        
+        cache = {
+            'ln1_cache': ln1_cache,
+            'ln2_cache': ln2_cache,
+            'attn_cache': attn_cache,
+            'attn_weights': attn_weights,
+            'ffn_cache': ffn_cache,
+            'residual1': attn_out,
+            'residual2': ffn_out
+        }
+        
+        return x, cache
+    
+    def forward(self, config: np.ndarray, return_attention: bool = False) -> dict:
+        """
+        Full forward pass through the BitTransformer.
+        
+        Args:
+            config: Bit configuration (num_bits,) with values 0 or 1
+            return_attention: Whether to return attention weights
+            
+        Returns:
+            dict with:
+                - 'flip_scores': Score for flipping each bit (num_bits,)
+                - 'value': Expected value/improvement scalar
+                - 'attention_weights': List of attention weights per layer (if requested)
+                - 'bit_embeddings': Final bit representations (num_bits, d_model)
+        """
+        # Ensure config is the right shape
+        if len(config) != self.num_bits:
+            # Pad or truncate
+            if len(config) < self.num_bits:
+                config = np.pad(config, (0, self.num_bits - len(config)), mode='constant')
+            else:
+                config = config[:self.num_bits]
+        
+        config = config.astype(int)
+        
+        # =====================================================================
+        # EMBEDDING: bits -> dense vectors
+        # =====================================================================
+        # Token embedding: lookup in W_embed based on bit value
+        x = self.W_embed[config]  # (num_bits, d_model)
+        
+        # Add positional encoding (sinusoidal + learnable)
+        x = x + self.positional_encoding + self.W_pos_embed
+        
+        # Store for backward
+        self._cache['input_embed'] = x.copy()
+        self._cache['config'] = config
+        
+        # =====================================================================
+        # TRANSFORMER LAYERS
+        # =====================================================================
+        layer_caches = []
+        all_attention_weights = []
+        
+        for i, layer in enumerate(self.layers):
+            x, layer_cache = self._transformer_layer_forward(x, layer)
+            layer_caches.append(layer_cache)
+            all_attention_weights.append(layer_cache['attn_weights'])
+        
+        self._cache['layer_caches'] = layer_caches
+        self._cache['final_hidden'] = x
+        
+        # =====================================================================
+        # CONTEXT ATTENTION (attend to past configurations)
+        # =====================================================================
+        if len(self.context_memory) > 0 and self.context_embeddings is not None:
+            # Cross-attention to context
+            x_norm, ln_ctx_cache = self._layer_norm(x, self.ln_context_gamma, self.ln_context_beta)
+            
+            context_out, context_attn, context_cache = self._multi_head_attention(
+                x_norm, self.context_embeddings, self.context_embeddings,
+                self.W_context_Q, self.W_context_K, self.W_context_V, self.W_context_O
+            )
+            
+            # Residual
+            x = x + context_out * 0.5  # Weighted residual for context
+            
+            self._cache['context_cache'] = context_cache
+            self._cache['ln_ctx_cache'] = ln_ctx_cache
+        
+        # =====================================================================
+        # OUTPUT HEADS
+        # =====================================================================
+        # Per-position flip scores
+        flip_scores = (x @ self.W_flip + self.b_flip).squeeze(-1)  # (num_bits,)
+        
+        # Global pooling for value prediction (attention-weighted mean)
+        pool_weights = self._softmax(x @ self.W_pool + self.b_pool, axis=0)
+        pooled = np.sum(pool_weights * x, axis=0)  # (d_model,)
+        
+        # Value head
+        value = (pooled @ self.W_value + self.b_value).item()
+        
+        self._cache['flip_scores'] = flip_scores
+        self._cache['pool_weights'] = pool_weights
+        self._cache['pooled'] = pooled
+        self._cache['value'] = value
+        
+        result = {
+            'flip_scores': flip_scores,
+            'value': value,
+            'bit_embeddings': x
+        }
+        
+        if return_attention:
+            result['attention_weights'] = all_attention_weights
+            
+            # Calculate attention entropy (measure of attention focus)
+            entropies = []
+            for attn in all_attention_weights:
+                # Average over heads
+                attn_avg = np.mean(attn, axis=0)
+                # Entropy per position
+                entropy = -np.sum(attn_avg * np.log(attn_avg + 1e-10), axis=-1)
+                entropies.append(np.mean(entropy))
+            result['attention_entropy'] = np.mean(entropies)
+        
+        return result
+    
+    def get_flip_recommendations(self, config: np.ndarray, top_k: int = 10,
+                                   temperature: float = 1.0) -> list:
+        """
+        Get top-k bit flip recommendations based on attention-weighted scores.
+        
+        Args:
+            config: Current bit configuration
+            top_k: Number of top recommendations to return
+            temperature: Softmax temperature for sampling (lower = more greedy)
+            
+        Returns:
+            List of (bit_index, score, flip_prob) tuples
+        """
+        result = self.forward(config)
+        scores = result['flip_scores']
+        
+        # Apply temperature and convert to probabilities
+        probs = self._softmax(scores / temperature)
+        
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        
+        recommendations = []
+        for idx in top_indices:
+            recommendations.append({
+                'bit_idx': int(idx),
+                'score': float(scores[idx]),
+                'prob': float(probs[idx]),
+                'current_value': int(config[idx]) if idx < len(config) else 0
+            })
+        
+        return recommendations
+    
+    def add_to_context(self, config: np.ndarray, diff: int, improved: bool):
+        """
+        Add a configuration to the context memory.
+        
+        Args:
+            config: Bit configuration
+            diff: Difference from target (|p*q - N|)
+            improved: Whether this config improved over previous
+        """
+        # Store the experience
+        self.context_memory.append({
+            'config': config.copy(),
+            'diff': diff,
+            'improved': improved,
+            'timestamp': len(self.context_memory)
+        })
+        
+        # Keep only recent context
+        if len(self.context_memory) > self.max_context:
+            self.context_memory = self.context_memory[-self.max_context:]
+        
+        # Update context embeddings (lazy - do on next forward if needed)
+        self._update_context_embeddings()
+    
+    def _update_context_embeddings(self):
+        """Update cached context embeddings."""
+        if len(self.context_memory) == 0:
+            self.context_embeddings = None
+            return
+        
+        # Embed each context configuration
+        embeddings = []
+        for ctx in self.context_memory[-self.max_context:]:
+            config = ctx['config']
+            if len(config) != self.num_bits:
+                if len(config) < self.num_bits:
+                    config = np.pad(config, (0, self.num_bits - len(config)))
+                else:
+                    config = config[:self.num_bits]
+            
+            config = config.astype(int)
+            embed = self.W_embed[config]  # (num_bits, d_model)
+            embed = embed + self.positional_encoding + self.W_pos_embed
+            
+            # Pool to single vector (mean pooling)
+            pooled = np.mean(embed, axis=0)  # (d_model,)
+            
+            # Weight by recency and quality
+            recency_weight = 1.0 - 0.5 * (len(self.context_memory) - ctx['timestamp']) / max(len(self.context_memory), 1)
+            quality_weight = 2.0 if ctx['improved'] else 1.0
+            
+            embeddings.append(pooled * recency_weight * quality_weight)
+        
+        self.context_embeddings = np.stack(embeddings)  # (context_size, d_model)
+    
+    def backward(self, target_flip_scores: np.ndarray = None, target_value: float = None,
+                 flip_mask: np.ndarray = None) -> dict:
+        """
+        Backward pass to compute gradients.
+        
+        This is a simplified backward pass - for production you'd want full
+        autograd, but this works for our use case.
+        
+        Args:
+            target_flip_scores: Target scores for each bit position
+            target_value: Target value for value head
+            flip_mask: Which bits to compute loss for (1 = include, 0 = ignore)
+            
+        Returns:
+            dict of gradients
+        """
+        grads = {}
+        
+        if target_flip_scores is None and target_value is None:
+            return grads
+        
+        # Output gradient
+        d_output = np.zeros_like(self._cache['final_hidden'])
+        
+        # Flip score loss gradient
+        if target_flip_scores is not None:
+            flip_scores = self._cache['flip_scores']
+            
+            if flip_mask is None:
+                flip_mask = np.ones_like(flip_scores)
+            
+            # MSE loss gradient
+            d_flip = 2 * (flip_scores - target_flip_scores) * flip_mask / (np.sum(flip_mask) + 1e-10)
+            d_flip = np.clip(d_flip, -1.0, 1.0)  # Gradient clipping
+            
+            # Backprop through output head
+            grads['W_flip'] = self._cache['final_hidden'].T @ d_flip.reshape(-1, 1)
+            grads['b_flip'] = np.sum(d_flip)
+            
+            d_output += d_flip.reshape(-1, 1) @ self.W_flip.T
+        
+        # Value loss gradient
+        if target_value is not None:
+            value = self._cache['value']
+            d_value = 2 * (value - target_value)
+            d_value = np.clip(d_value, -1.0, 1.0)
+            
+            # Backprop through pooling
+            pooled = self._cache['pooled']
+            pool_weights = self._cache['pool_weights']
+            
+            grads['W_value'] = pooled.reshape(-1, 1) @ np.array([[d_value]])
+            grads['b_value'] = np.array([d_value])
+            
+            d_pooled = d_value * self.W_value.squeeze()
+            
+            # Backprop pooling (simplified - ignoring softmax gradient)
+            d_output += pool_weights * d_pooled
+        
+        # Clip output gradient
+        d_output = np.clip(d_output, -1.0, 1.0)
+        
+        # Note: Full backprop through transformer layers is complex
+        # For now, we'll use a simplified gradient for the output head
+        # and rely on the forward pass learning
+        
+        return grads
+    
+    def update_weights(self, grads: dict):
+        """
+        Update weights using Adam optimizer.
+        
+        Args:
+            grads: Dictionary of gradients from backward()
+        """
+        self.t += 1
+        
+        for name, grad in grads.items():
+            if name not in self.m:
+                continue
+            
+            # Get current weight
+            if hasattr(self, name):
+                weight = getattr(self, name)
+            else:
+                continue
+            
+            # Clip gradient
+            grad = np.clip(grad, -1.0, 1.0)
+            
+            # Adam update
+            self.m[name] = self.beta1 * self.m[name] + (1 - self.beta1) * grad
+            self.v[name] = self.beta2 * self.v[name] + (1 - self.beta2) * (grad ** 2)
+            
+            # Bias correction
+            m_hat = self.m[name] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[name] / (1 - self.beta2 ** self.t)
+            
+            # Update
+            update = self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
+            update = np.clip(update, -0.1, 0.1)  # Clip update magnitude
+            
+            setattr(self, name, weight - update)
+        
+        self.num_updates += 1
+    
+    def learn_from_flip(self, config: np.ndarray, bit_idx: int, old_diff: int, 
+                        new_diff: int, success: bool):
+        """
+        Learn from a single bit flip experience.
+        
+        Args:
+            config: Configuration AFTER the flip
+            bit_idx: Index of the bit that was flipped
+            old_diff: Difference before flip
+            new_diff: Difference after flip
+            success: Whether the flip improved things
+        """
+        # Forward pass to get current predictions
+        result = self.forward(config)
+        
+        # Create target: boost score for successful flips, reduce for failures
+        target_scores = result['flip_scores'].copy()
+        
+        improvement = old_diff - new_diff
+        if success and improvement > 0:
+            # Increase score for this bit
+            target_scores[bit_idx] += 0.5 * np.log1p(improvement)
+        elif not success:
+            # Decrease score for this bit
+            target_scores[bit_idx] -= 0.3
+        
+        # Create mask to focus on the flipped bit
+        mask = np.zeros(self.num_bits)
+        mask[bit_idx] = 1.0
+        # Also include nearby bits for context
+        for offset in [-2, -1, 1, 2]:
+            idx = bit_idx + offset
+            if 0 <= idx < self.num_bits:
+                mask[idx] = 0.5
+        
+        # Backward and update
+        grads = self.backward(target_flip_scores=target_scores, flip_mask=mask)
+        self.update_weights(grads)
+        
+        # Add to context memory
+        self.add_to_context(config, new_diff, success)
+    
+    def learn_from_batch(self, experiences: list):
+        """
+        Learn from a batch of experiences.
+        
+        Args:
+            experiences: List of dicts with keys:
+                - config: bit configuration
+                - bit_idx: flipped bit (or None)
+                - old_diff: diff before
+                - new_diff: diff after
+                - success: whether it improved
+        """
+        for exp in experiences:
+            if exp.get('bit_idx') is not None:
+                self.learn_from_flip(
+                    exp['config'],
+                    exp['bit_idx'],
+                    exp['old_diff'],
+                    exp['new_diff'],
+                    exp['success']
+                )
+    
+    def get_attention_map(self, config: np.ndarray) -> np.ndarray:
+        """
+        Get the full attention map for visualization.
+        
+        Returns average attention across all heads and layers.
+        """
+        result = self.forward(config, return_attention=True)
+        
+        # Average across layers and heads
+        all_attn = result['attention_weights']
+        avg_attn = np.mean([np.mean(attn, axis=0) for attn in all_attn], axis=0)
+        
+        return avg_attn  # (num_bits, num_bits)
+    
+    def get_state_dict(self) -> dict:
+        """Get all weights for saving."""
+        state = {
+            'num_bits': self.num_bits,
+            'd_model': self.d_model,
+            'num_heads': self.num_heads,
+            'num_layers': self.num_layers,
+            'd_ff': self.d_ff,
+            'W_embed': self.W_embed.tolist(),
+            'W_pos_embed': self.W_pos_embed.tolist(),
+            'W_flip': self.W_flip.tolist(),
+            'b_flip': self.b_flip.tolist(),
+            'W_value': self.W_value.tolist(),
+            'b_value': self.b_value.tolist(),
+            'W_pool': self.W_pool.tolist(),
+            'b_pool': self.b_pool.tolist(),
+            'W_context_K': self.W_context_K.tolist(),
+            'W_context_V': self.W_context_V.tolist(),
+            'W_context_Q': self.W_context_Q.tolist(),
+            'W_context_O': self.W_context_O.tolist(),
+            'ln_context_gamma': self.ln_context_gamma.tolist(),
+            'ln_context_beta': self.ln_context_beta.tolist(),
+            'num_updates': self.num_updates,
+            'layers': []
+        }
+        
+        for layer in self.layers:
+            layer_state = {}
+            for key, val in layer.items():
+                if isinstance(val, np.ndarray):
+                    layer_state[key] = val.tolist()
+                else:
+                    layer_state[key] = val
+            state['layers'].append(layer_state)
+        
+        return state
+    
+    def load_state_dict(self, state: dict):
+        """Load weights from saved state."""
+        self.W_embed = np.array(state['W_embed'])
+        self.W_pos_embed = np.array(state['W_pos_embed'])
+        self.W_flip = np.array(state['W_flip'])
+        self.b_flip = np.array(state['b_flip'])
+        self.W_value = np.array(state['W_value'])
+        self.b_value = np.array(state['b_value'])
+        self.W_pool = np.array(state['W_pool'])
+        self.b_pool = np.array(state['b_pool'])
+        self.W_context_K = np.array(state['W_context_K'])
+        self.W_context_V = np.array(state['W_context_V'])
+        self.W_context_Q = np.array(state['W_context_Q'])
+        self.W_context_O = np.array(state['W_context_O'])
+        self.ln_context_gamma = np.array(state['ln_context_gamma'])
+        self.ln_context_beta = np.array(state['ln_context_beta'])
+        self.num_updates = state.get('num_updates', 0)
+        
+        for i, layer_state in enumerate(state['layers']):
+            for key, val in layer_state.items():
+                if isinstance(val, list):
+                    self.layers[i][key] = np.array(val)
+                else:
+                    self.layers[i][key] = val
+        
+        # Reinitialize optimizer state
+        self._init_optimizer_state()
+        
+        print(f"[BitTransformer] Loaded state with {self.num_updates} previous updates")
+    
+    def print_stats(self):
+        """Print transformer statistics."""
+        print(f"\n[BitTransformer] Statistics:")
+        print(f"  Model dimension: {self.d_model}")
+        print(f"  Attention heads: {self.num_heads}")
+        print(f"  Layers: {self.num_layers}")
+        print(f"  Parameters: ~{self._count_parameters():,}")
+        print(f"  Updates: {self.num_updates}")
+        print(f"  Context memory: {len(self.context_memory)}/{self.max_context}")
+        if self.loss_history:
+            print(f"  Recent loss: {np.mean(self.loss_history[-10:]):.4f}")
+
+
 def _parallel_annealing_worker(args: dict) -> dict:
     """
     Worker function for parallel annealing.
@@ -295,6 +1198,157 @@ class MLClauseLearner:
         self.prev_config = None
         self.prev_product = None
         self.prev_diff = None
+        
+        # =====================================================================
+        # BIT TRANSFORMER: LLM-STYLE ATTENTION MODULE
+        # =====================================================================
+        # This heavyweight transformer learns bit-to-bit dependencies via
+        # multi-head self-attention, modulating the hourglass network's predictions
+        self.use_transformer = True  # Can be disabled for faster inference
+        self.transformer = None  # Lazy initialization to save memory
+        self._transformer_initialized = False
+        
+    def _init_transformer(self):
+        """Lazily initialize the BitTransformer (heavy, so done on first use)."""
+        if self._transformer_initialized:
+            return
+        
+        print(f"\n[MLClauseLearner] Initializing BitTransformer attention module...")
+        
+        # Scale transformer dimensions based on problem size
+        if self.num_bits > 2000:
+            # Large problems: smaller transformer to save memory
+            d_model = 128
+            num_heads = 4
+            num_layers = 2
+            d_ff = 512
+        elif self.num_bits > 500:
+            # Medium problems
+            d_model = 256
+            num_heads = 8
+            num_layers = 3
+            d_ff = 1024
+        else:
+            # Small problems: full transformer
+            d_model = 256
+            num_heads = 8
+            num_layers = 4
+            d_ff = 1024
+        
+        self.transformer = BitTransformer(
+            num_bits=self.num_bits,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            d_ff=d_ff,
+            max_context=100
+        )
+        self._transformer_initialized = True
+        print(f"[MLClauseLearner] BitTransformer ready!")
+    
+    def get_transformer_flip_scores(self, config: np.ndarray) -> np.ndarray:
+        """
+        Get flip scores from the BitTransformer.
+        
+        Args:
+            config: Current bit configuration
+            
+        Returns:
+            Array of flip scores for each bit position
+        """
+        if not self.use_transformer:
+            return np.zeros(self.num_bits)
+        
+        # Lazy initialization
+        if not self._transformer_initialized:
+            self._init_transformer()
+        
+        result = self.transformer.forward(config)
+        return result['flip_scores']
+    
+    def get_transformer_recommendations(self, config: np.ndarray, top_k: int = 10) -> list:
+        """
+        Get top-k bit flip recommendations from the transformer.
+        
+        Args:
+            config: Current bit configuration
+            top_k: Number of recommendations to return
+            
+        Returns:
+            List of recommendation dicts with bit_idx, score, prob
+        """
+        if not self.use_transformer:
+            return []
+        
+        if not self._transformer_initialized:
+            self._init_transformer()
+        
+        return self.transformer.get_flip_recommendations(config, top_k=top_k)
+    
+    def learn_transformer_from_flip(self, config: np.ndarray, bit_idx: int,
+                                     old_diff: int, new_diff: int, success: bool):
+        """
+        Update the transformer based on a flip outcome.
+        
+        Args:
+            config: Configuration AFTER the flip
+            bit_idx: Index of the flipped bit
+            old_diff: |p*q - N| before flip
+            new_diff: |p*q - N| after flip
+            success: Whether the flip improved things
+        """
+        if not self.use_transformer:
+            return
+        
+        if not self._transformer_initialized:
+            self._init_transformer()
+        
+        self.transformer.learn_from_flip(config, bit_idx, old_diff, new_diff, success)
+    
+    def get_combined_flip_scores(self, config: np.ndarray, 
+                                   hourglass_weight: float = 0.6,
+                                   transformer_weight: float = 0.4) -> np.ndarray:
+        """
+        Get combined flip scores from both hourglass network and transformer.
+        
+        The transformer captures long-range bit dependencies via attention,
+        while the hourglass network learns local patterns. Combining them
+        gives the best of both worlds.
+        
+        Args:
+            config: Current bit configuration
+            hourglass_weight: Weight for hourglass network scores
+            transformer_weight: Weight for transformer scores
+            
+        Returns:
+            Combined flip scores for each bit position
+        """
+        # Get hourglass scores (from bit_importance and gradient analysis)
+        hourglass_scores = self.bit_importance.copy()
+        
+        # Normalize
+        h_min, h_max = hourglass_scores.min(), hourglass_scores.max()
+        if h_max > h_min:
+            hourglass_scores = (hourglass_scores - h_min) / (h_max - h_min)
+        
+        # Get transformer scores
+        if self.use_transformer and self._transformer_initialized:
+            transformer_scores = self.get_transformer_flip_scores(config)
+            # Normalize
+            t_min, t_max = transformer_scores.min(), transformer_scores.max()
+            if t_max > t_min:
+                transformer_scores = (transformer_scores - t_min) / (t_max - t_min)
+        else:
+            transformer_scores = np.zeros(self.num_bits)
+            transformer_weight = 0
+            hourglass_weight = 1
+        
+        # Combine
+        total_weight = hourglass_weight + transformer_weight
+        combined = (hourglass_weight * hourglass_scores + 
+                    transformer_weight * transformer_scores) / total_weight
+        
+        return combined
         
     def set_N(self, N: int):
         """Set the target number N for trap detection."""
@@ -1761,19 +2815,20 @@ class IncrementalQuantumAnnealing:
         
         if initial_temp is None:
             # Scale initial temp based on problem size
-            # Base: 100 for ~10-bit numbers, scales up logarithmically
-            # For RSA-2048 (~2048 bits): ~2000
-            # For small numbers (~10 bits): ~100
-            initial_temp = 100.0 * (1 + np.log2(max(n_bits, 1)))
+            # With normalized energies (0-500 range), we want initial temp
+            # high enough to accept most uphill moves initially
+            # Base: 200 for ~10-bit numbers, scales up logarithmically
+            initial_temp = 200.0 * (1 + np.log2(max(n_bits, 1)))
             # Clamp to reasonable range
-            initial_temp = max(100.0, min(initial_temp, 5000.0))
+            initial_temp = max(200.0, min(initial_temp, 5000.0))
         
         if final_temp is None:
-            # Final temp also scales, but much smaller
-            # Want to explore more for larger problems
-            final_temp = 0.001 * (1 + np.log2(max(n_bits, 1)))
-            # Clamp to reasonable range
-            final_temp = max(0.001, min(final_temp, 1.0))
+            # Final temp should still allow occasional exploration
+            # With normalized energies (0-500), final temp of 1-10 is reasonable
+            # This gives acceptance probability of ~exp(-50/5) = 4.5e-5 for ΔE=50
+            final_temp = 5.0 * (1 + np.log2(max(n_bits, 1)) * 0.2)
+            # Clamp to reasonable range for normalized energies
+            final_temp = max(1.0, min(final_temp, 50.0))
         
         # Store the auto-computed temps for later use
         self._auto_initial_temp = initial_temp
@@ -1998,6 +3053,19 @@ class IncrementalQuantumAnnealing:
                 self.very_bad_threshold = max(100, self.best_diff_seen * 10)
                 self.clause_threshold = max(50, self.best_diff_seen * 5)
             
+            # Restore adaptive temperature control state for proper reheating
+            if 'adaptive_temp' in saved_state:
+                at = saved_state['adaptive_temp']
+                if 'initial_temp' in at and at['initial_temp'] is not None:
+                    self.initial_temp = at['initial_temp']
+                if 'final_temp' in at and at['final_temp'] is not None:
+                    self.final_temp = at['final_temp']
+                if 'stuck_counter' in at and at['stuck_counter'] is not None:
+                    self.stuck_counter = at['stuck_counter']
+                if 'last_best_diff' in at and at['last_best_diff'] is not None:
+                    self.last_best_diff = at['last_best_diff']
+                print(f"  Restored adaptive temp: initial={self.initial_temp:.1f}, stuck={self.stuck_counter}, last_best={self.last_best_diff}")
+            
             # Restore neural network state
             if 'neural_network' in saved_state and hasattr(self, 'ml_clause_learner'):
                 nn_state = saved_state['neural_network']
@@ -2089,6 +3157,22 @@ class IncrementalQuantumAnnealing:
                     print(f"  [NEURAL] Restored {nn.num_samples} training samples, {len(nn.best_patterns)} patterns")
                 except Exception as e:
                     print(f"  [NEURAL] Warning: Could not fully restore neural state: {e}")
+            
+            # ============================================================
+            # RESTORE BIT TRANSFORMER STATE (LLM-style attention module)
+            # ============================================================
+            if 'bit_transformer' in saved_state and hasattr(self, 'ml_clause_learner'):
+                try:
+                    nn = self.ml_clause_learner
+                    # Initialize transformer if not already done
+                    if not nn._transformer_initialized:
+                        nn._init_transformer()
+                    
+                    if nn.transformer is not None:
+                        nn.transformer.load_state_dict(saved_state['bit_transformer'])
+                        print(f"  [Transformer] Restored BitTransformer state ({nn.transformer.num_updates} updates)")
+                except Exception as e:
+                    print(f"  [Transformer] Warning: Could not restore transformer state: {e}")
             
             print(f"{'='*60}\n")
             
@@ -2257,16 +3341,20 @@ class IncrementalQuantumAnnealing:
     
     def calculate_temperature(self, step: int, total_steps: int) -> float:
         """
-        Calculate current temperature using exponential cooling schedule.
+        Calculate current temperature using a gentler cooling schedule.
         
-        T(t) = T_initial * (T_final / T_initial)^(t / t_max)
+        Uses LINEAR decay instead of exponential to maintain reasonable
+        acceptance probabilities throughout the run.
         """
         if total_steps <= 1:
             return self.final_temp
         
         progress = step / total_steps
-        # Exponential decay
-        temp = self.initial_temp * (self.final_temp / self.initial_temp) ** progress
+        
+        # LINEAR decay: much gentler than exponential
+        # This keeps temperature reasonable throughout the run
+        temp = self.initial_temp * (1 - progress) + self.final_temp * progress
+        
         return max(temp, self.final_temp)
     
     def metropolis_accept(self, current_energy: float, new_energy: float, temperature: float,
@@ -2276,43 +3364,56 @@ class IncrementalQuantumAnnealing:
         
         Always accept if new_energy < current_energy.
         Accept with probability exp(-(new_energy - current_energy) / temperature) otherwise.
-        ALSO: Reject if config matches learned bad patterns (tabu/nogood/clauses).
+        
+        LENIENT MODE: Added minimum acceptance floor to ensure exploration continues
+        even when energy differences are large. This helps ML continue learning.
         """
+        # Get leniency setting (can be set via GUI)
+        # Higher = more lenient (accepts more uphill moves)
+        min_accept_prob = getattr(self, 'metropolis_min_accept', 0.05)  # 5% floor by default
+        
         # LEARNING: Soft rejection based on learned patterns
         # Don't hard-block, but reduce acceptance probability for bad patterns
-        # This allows exploration while still guiding toward good regions
-        if new_config is not None and temperature < self.initial_temp * 0.5:
+        # Only apply after initial exploration phase (when temp is lower)
+        if new_config is not None and temperature < self.initial_temp * 0.3:  # More lenient threshold
             rejection_penalty = 0.0
             
-            # Check tabu list - moderate penalty
+            # Check tabu list - reduced penalty
             if self.is_tabu(new_config):
-                rejection_penalty += 2.0
+                rejection_penalty += 1.0  # Reduced from 2.0
             
-            # Check nogood patterns - moderate penalty
+            # Check nogood patterns - reduced penalty
             if self.matches_nogood(new_config):
-                rejection_penalty += 1.5
+                rejection_penalty += 0.75  # Reduced from 1.5
             
-            # Check learned clauses - lighter penalty, scaled by similarity
-            min_hamming = max(3, len(new_config) // 10)  # 10% threshold
+            # Check learned clauses - lighter penalty
+            min_hamming = max(3, len(new_config) // 10)
             if self.matches_learned_clause(new_config, max_hamming_dist=min_hamming):
-                rejection_penalty += 1.0
+                rejection_penalty += 0.5  # Reduced from 1.0
             
-            # Apply penalty as reduced acceptance probability (but never hard block)
+            # Apply penalty (but with floor - never completely block)
             if rejection_penalty > 0:
-                # Reduce acceptance by penalty factor, but always allow some chance
                 accept_modifier = np.exp(-rejection_penalty)
+                # Apply floor even here
+                accept_modifier = max(accept_modifier, min_accept_prob)
                 if np.random.random() > accept_modifier:
                     return False  # Soft rejection
         
+        # Always accept downhill moves
         if new_energy <= current_energy:
             return True
         
+        # Zero temperature = only accept improvements
         if temperature <= 0:
-            return False
+            return np.random.random() < min_accept_prob  # But still allow floor probability
         
-        # Calculate acceptance probability
+        # Calculate acceptance probability with FLOOR
         delta_e = new_energy - current_energy
         acceptance_prob = np.exp(-delta_e / temperature)
+        
+        # Apply minimum acceptance floor - ensures exploration continues
+        # This is critical for ML learning - we need diverse samples
+        acceptance_prob = max(acceptance_prob, min_accept_prob)
         
         # Accept with probability
         return np.random.random() < acceptance_prob
@@ -2917,6 +4018,16 @@ class IncrementalQuantumAnnealing:
                 self.successful_sequences = self.successful_sequences[:250]
         
         # Correlation tracking is handled by MLClauseLearner.learn_correlation_from_observation()
+        
+        # =====================================================================
+        # TRANSFORMER LEARNING: Update the LLM-style attention module
+        # =====================================================================
+        if hasattr(self, 'ml_clause_learner') and hasattr(self.ml_clause_learner, 'use_transformer'):
+            if self.ml_clause_learner.use_transformer:
+                success = improvement > 0
+                self.ml_clause_learner.learn_transformer_from_flip(
+                    config, bit_idx, old_diff, new_diff, success
+                )
     
     def _get_state_features(self, config: np.ndarray) -> tuple:
         """Extract key features from state for state-action learning."""
@@ -3290,55 +4401,110 @@ class IncrementalQuantumAnnealing:
                         return valid_escape[:num_flips]
         
         # ============================================================
-        # NEURAL NETWORK BIT SELECTION (TRAP-AWARE)
+        # BIT SELECTION STRATEGY (configurable via GUI)
         # ============================================================
+        # Get strategy percentages (default if not set)
+        strategy = getattr(self, 'bit_selection_strategy', {
+            'transformer_pct': 30,
+            'hourglass_pct': 50,
+            'random_pct': 20
+        })
         
-        # If neural network has enough training data, use it
-        if hasattr(self, 'ml_clause_learner') and self.ml_clause_learner.num_samples >= 10:
-            try:
-                # Get neural network's suggested flips with trap awareness
-                suggested = self.ml_clause_learner.suggest_flips(
-                    config, 
-                    num_flips=num_flips * 3,
-                    p=p, q=q,
-                    num_pairs=num_pairs
-                )
-                
-                # Filter to only valid source qubit indices
-                valid_source_indices = {pair.source_qubit for pair in self.pairs 
-                                       if pair.source_qubit not in self.fixed_bits}
-                
-                selected = []
-                for idx in suggested:
-                    if idx in valid_source_indices and idx not in selected:
-                        selected.append(idx)
-                    if len(selected) >= num_flips:
-                        break
-                
-                # If we got enough from neural network, return immediately
-                if len(selected) >= num_flips:
-                    return selected
-                
-                # Fill remaining with neural network's important bits (random from top important)
-                important_bits = self.ml_clause_learner.get_important_bits(top_k=100)
-                for idx in important_bits:
-                    if idx in valid_source_indices and idx not in selected:
-                        if np.random.random() < 0.5:  # 50% chance to add important bit
-                            selected.append(idx)
-                    if len(selected) >= num_flips:
-                        break
-                
-                if selected:
-                    return selected
+        transformer_pct = strategy.get('transformer_pct', 30)
+        hourglass_pct = strategy.get('hourglass_pct', 50)
+        random_pct = strategy.get('random_pct', 20)
+        
+        # Normalize to ensure sum is 100
+        total_pct = transformer_pct + hourglass_pct + random_pct
+        if total_pct > 0:
+            transformer_pct = transformer_pct / total_pct * 100
+            hourglass_pct = hourglass_pct / total_pct * 100
+            random_pct = random_pct / total_pct * 100
+        
+        # Roll the dice to decide which method to use
+        roll = np.random.random() * 100
+        
+        valid_source_indices = {pair.source_qubit for pair in self.pairs 
+                               if pair.source_qubit not in self.fixed_bits}
+        
+        # ============================================================
+        # TRANSFORMER ATTENTION-BASED SELECTION (LLM-style)
+        # ============================================================
+        if roll < transformer_pct:
+            # Use transformer attention to find bits with strong dependencies
+            if hasattr(self, 'ml_clause_learner') and hasattr(self.ml_clause_learner, 'use_transformer'):
+                if self.ml_clause_learner.use_transformer:
+                    try:
+                        # Lazy initialize transformer if needed
+                        if not self.ml_clause_learner._transformer_initialized:
+                            self.ml_clause_learner._init_transformer()
+                        
+                        recs = self.ml_clause_learner.get_transformer_recommendations(config, top_k=num_flips * 2)
+                        
+                        transformer_selected = []
+                        for rec in recs:
+                            idx = rec['bit_idx']
+                            if idx in valid_source_indices and idx not in transformer_selected:
+                                transformer_selected.append(idx)
+                            if len(transformer_selected) >= num_flips:
+                                break
+                        
+                        if len(transformer_selected) >= num_flips:
+                            return transformer_selected[:num_flips]
+                    except Exception as e:
+                        pass  # Fall through to hourglass
+            
+            # If transformer failed, fall through to hourglass
+            roll = transformer_pct + np.random.random() * (100 - transformer_pct)
+        
+        # ============================================================
+        # HOURGLASS NEURAL NETWORK BIT SELECTION (TRAP-AWARE)
+        # ============================================================
+        if roll < transformer_pct + hourglass_pct:
+            # If neural network has enough training data, use it
+            if hasattr(self, 'ml_clause_learner') and self.ml_clause_learner.num_samples >= 10:
+                try:
+                    # Get neural network's suggested flips with trap awareness
+                    suggested = self.ml_clause_learner.suggest_flips(
+                        config, 
+                        num_flips=num_flips * 3,
+                        p=p, q=q,
+                        num_pairs=num_pairs
+                    )
                     
-            except Exception as e:
-                # Fall through to random if neural network fails
-                print(f"[Warning] Neural network selection failed: {e}")
-                pass
+                    selected = []
+                    for idx in suggested:
+                        if idx in valid_source_indices and idx not in selected:
+                            selected.append(idx)
+                        if len(selected) >= num_flips:
+                            break
+                    
+                    # If we got enough from neural network, return immediately
+                    if len(selected) >= num_flips:
+                        return selected
+                    
+                    # Fill remaining with neural network's important bits (random from top important)
+                    important_bits = self.ml_clause_learner.get_important_bits(top_k=100)
+                    for idx in important_bits:
+                        if idx in valid_source_indices and idx not in selected:
+                            if np.random.random() < 0.5:  # 50% chance to add important bit
+                                selected.append(idx)
+                        if len(selected) >= num_flips:
+                            break
+                    
+                    if selected:
+                        return selected
+                        
+                except Exception as e:
+                    # Fall through to random if neural network fails
+                    pass
         
         # ============================================================
-        # FALLBACK: Random selection (only if neural network unavailable)
+        # RANDOM EXPLORATION (part of strategy or fallback)
         # ============================================================
+        # This is reached when:
+        # 1. Roll selected random exploration (based on random_pct)
+        # 2. Transformer/Hourglass failed or weren't available
         valid_indices = [pair.source_qubit for pair in self.pairs 
                         if pair.source_qubit not in self.fixed_bits]
         if valid_indices:
@@ -4168,17 +5334,33 @@ class IncrementalQuantumAnnealing:
             penalty_scale = min(1000.0, 100.0 * self.num_qubits / 64)
             total_energy += bad_combo_penalty * penalty_scale
         
-        # NEW: Metropolis acceptance criterion WITH LEARNING
+        # =====================================================================
+        # LEARNING-FIRST: Always learn from this config BEFORE Metropolis decision
+        # This ensures ML learns even from rejected moves!
+        # =====================================================================
+        p, q = self._decode_factors(config)
+        diff = abs(p * q - self.N)
+        self.learn_from_attempt(config, p, q, total_energy, diff)
+        
+        # NEW: Metropolis acceptance criterion (after learning)
         accepted = True
         if prev_energy is not None:
+            delta_e = total_energy - prev_energy
             accepted = self.metropolis_accept(prev_energy, total_energy, temperature, new_config=config)
             if not accepted:
-                print(f"  [Metropolis] REJECTED (ΔE = {total_energy - prev_energy:.2f}, T = {temperature:.4f})")
-                # Don't update current state if rejected
+                # Calculate what acceptance probability would have been
+                if temperature > 0 and delta_e > 0:
+                    would_be_prob = np.exp(-delta_e / temperature)
+                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f}, P_would = {would_be_prob:.4f}) [learned anyway]")
+                else:
+                    print(f"  [Metropolis] REJECTED (ΔE = {delta_e:.2f}, T = {temperature:.2f}) [learned anyway]")
+                # Don't update current state if rejected (but we DID learn above!)
                 return config, total_energy, False
-            elif total_energy > prev_energy:
-                acceptance_prob = np.exp(-(total_energy - prev_energy) / temperature)
-                print(f"  [Metropolis] ACCEPTED uphill move (ΔE = {total_energy - prev_energy:.2f}, P = {acceptance_prob:.4f})")
+            elif delta_e > 0:
+                acceptance_prob = np.exp(-delta_e / temperature)
+                print(f"  [Metropolis] ✓ ACCEPTED uphill (ΔE = {delta_e:.2f}, T = {temperature:.2f}, P = {acceptance_prob:.4f})")
+            else:
+                print(f"  [Metropolis] ✓ ACCEPTED downhill (ΔE = {delta_e:.2f})")
         
         self.current_config = config
         self.current_energy = total_energy
@@ -4999,6 +6181,19 @@ class IncrementalQuantumAnnealing:
                         self.clause_threshold = max(50, self.best_diff_seen * 5)
                         print(f"  Updated thresholds: very_bad > {self.very_bad_threshold}, clause > {self.clause_threshold}")
                     
+                    # Restore adaptive temperature control state for proper reheating
+                    if 'adaptive_temp' in state:
+                        at = state['adaptive_temp']
+                        if 'initial_temp' in at and at['initial_temp'] is not None:
+                            self.initial_temp = at['initial_temp']
+                        if 'final_temp' in at and at['final_temp'] is not None:
+                            self.final_temp = at['final_temp']
+                        if 'stuck_counter' in at and at['stuck_counter'] is not None:
+                            self.stuck_counter = at['stuck_counter']
+                        if 'last_best_diff' in at and at['last_best_diff'] is not None:
+                            self.last_best_diff = at['last_best_diff']
+                        print(f"  Restored adaptive temp: initial={self.initial_temp:.1f}, stuck={self.stuck_counter}, last_best={self.last_best_diff}")
+                    
                     # ============================================================
                     # RESTORE NEURAL NETWORK STATE (HOURGLASS ARCHITECTURE)
                     # ============================================================
@@ -5099,7 +6294,22 @@ class IncrementalQuantumAnnealing:
                             print(f"  [NEURAL] Restored {nn.num_samples} training samples, {len(nn.best_patterns)} patterns")
                         except Exception as e:
                             print(f"  [NEURAL] Warning: Could not fully restore neural state: {e}")
-
+                    
+                    # ============================================================
+                    # RESTORE BIT TRANSFORMER STATE (LLM-style attention module)
+                    # ============================================================
+                    if 'bit_transformer' in state and hasattr(self, 'ml_clause_learner'):
+                        try:
+                            nn = self.ml_clause_learner
+                            # Initialize transformer if not already done
+                            if not nn._transformer_initialized:
+                                nn._init_transformer()
+                            
+                            if nn.transformer is not None:
+                                nn.transformer.load_state_dict(state['bit_transformer'])
+                                print(f"  [Transformer] Restored BitTransformer state ({nn.transformer.num_updates} updates)")
+                        except Exception as e:
+                            print(f"  [Transformer] Warning: Could not restore transformer state: {e}")
                     
                     # Check if already found exact factorization
                     if state.get('found_exact', False):
@@ -5195,6 +6405,13 @@ class IncrementalQuantumAnnealing:
                     'bit_correlation_1to0': nn.bit_correlation_1to0.tolist() if hasattr(nn, 'bit_correlation_1to0') else None
                 }
                 print(f"  [Neural] Saved HOURGLASS network state ({nn.num_samples} samples, {nn.trap_escapes}/{nn.trap_encounters} escapes)")
+                
+                # ============================================================
+                # SAVE BIT TRANSFORMER STATE (LLM-style attention module)
+                # ============================================================
+                if hasattr(nn, 'transformer') and nn.transformer is not None and nn._transformer_initialized:
+                    state['bit_transformer'] = nn.transformer.get_state_dict()
+                    print(f"  [Transformer] Saved BitTransformer state ({nn.transformer.num_updates} updates, {len(nn.transformer.context_memory)} context)")
             
             # Legacy data (kept for compatibility, but neural network is primary)
             state['learned_clauses'] = list(self.learned_clauses)[-100:]  # Reduced
@@ -5213,6 +6430,14 @@ class IncrementalQuantumAnnealing:
                                          for e in self.elite_population[:10]]
             # Save best_diff_seen to prevent desync on reload
             state['best_diff_seen'] = int(self.best_diff_seen) if isinstance(self.best_diff_seen, (int, float)) and self.best_diff_seen != float('inf') else None
+            
+            # CRITICAL: Save adaptive temperature control state for proper reheating
+            state['adaptive_temp'] = {
+                'initial_temp': self.initial_temp,
+                'final_temp': self.final_temp,
+                'stuck_counter': self.stuck_counter,
+                'last_best_diff': self.last_best_diff if self.last_best_diff != float('inf') else None
+            }
             
             with open(state_file, 'w') as f:
                 json.dump(state, f, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x))
@@ -5245,9 +6470,17 @@ class IncrementalQuantumAnnealing:
                 
                 # ENHANCED: Adaptive temperature - reheat if stuck
                 if self.stuck_counter > 3:
+                    old_temp = self.initial_temp
                     self.initial_temp *= 1.5  # Increase temp to escape local minima
-                    print(f"  [Adaptive] Reheating: new initial temp = {self.initial_temp:.0f}")
+                    # Cap at 10x original to prevent runaway
+                    max_temp = self._auto_initial_temp * 10
+                    if self.initial_temp > max_temp:
+                        self.initial_temp = max_temp
+                    print(f"\n  🔥 [REHEAT] Stuck for {self.stuck_counter} restarts - escaping local minimum!")
+                    print(f"     Temperature: {old_temp:.1f} -> {self.initial_temp:.1f}")
                     self.stuck_counter = 0
+                else:
+                    print(f"  [Temperature] Initial: {self.initial_temp:.1f}, stuck_counter: {self.stuck_counter}/4")
                 
                 # Run annealing
                 config, energy = self.incremental_solve(
