@@ -15,6 +15,87 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 
+# =============================================================================
+# GPU ACCELERATION SETUP (PyTorch, Intel IPEX, CuPy)
+# =============================================================================
+GPU_AVAILABLE = False
+GPU_BACKEND = None
+GPU_DEVICE = None
+
+# Try Intel Extension for PyTorch first (best for Intel iGPU)
+try:
+    import intel_extension_for_pytorch as ipex
+    import torch
+    GPU_AVAILABLE = True
+    GPU_BACKEND = 'intel_ipex'
+    GPU_DEVICE = 'xpu' if torch.xpu.is_available() else 'cpu'
+    if torch.xpu.is_available():
+        print(f"[GPU] ✅ Intel IPEX with XPU (Intel iGPU) available")
+        print(f"[GPU]    Device: {torch.xpu.get_device_name(0)}")
+    else:
+        print(f"[GPU] ⚠️ Intel IPEX loaded but running on optimized CPU")
+except (ImportError, AttributeError, Exception) as e:
+    # IPEX may have bugs (e.g., os.exit instead of sys.exit)
+    pass
+
+# Try PyTorch next
+if not GPU_AVAILABLE:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            GPU_AVAILABLE = True
+            GPU_BACKEND = 'torch_cuda'
+            GPU_DEVICE = torch.device('cuda')
+            print(f"[GPU] ✅ PyTorch CUDA available: {torch.cuda.get_device_name(0)}")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            # Apple Silicon GPU
+            GPU_AVAILABLE = True
+            GPU_BACKEND = 'torch_mps'
+            GPU_DEVICE = torch.device('mps')
+            print(f"[GPU] ✅ PyTorch MPS (Apple Silicon) available")
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            # Intel iGPU via Intel Extension for PyTorch
+            GPU_AVAILABLE = True
+            GPU_BACKEND = 'torch_xpu'
+            GPU_DEVICE = torch.device('xpu')
+            print(f"[GPU] ✅ PyTorch XPU (Intel iGPU) available")
+        else:
+            print(f"[GPU] ⚠️ PyTorch found but no GPU backend available")
+    except ImportError:
+        pass
+
+# Try CuPy as fallback (NVIDIA only)
+if not GPU_AVAILABLE:
+    try:
+        import cupy as cp
+        GPU_AVAILABLE = True
+        GPU_BACKEND = 'cupy'
+        print(f"[GPU] ✅ CuPy CUDA available")
+    except ImportError:
+        pass
+
+# Try OpenCL via PyOpenCL (works on most GPUs including Intel iGPU)
+if not GPU_AVAILABLE:
+    try:
+        import pyopencl as cl
+        platforms = cl.get_platforms()
+        for platform in platforms:
+            devices = platform.get_devices(device_type=cl.device_type.GPU)
+            if devices:
+                GPU_AVAILABLE = True
+                GPU_BACKEND = 'opencl'
+                GPU_DEVICE = devices[0]
+                print(f"[GPU] ✅ OpenCL available: {devices[0].name}")
+                break
+    except ImportError:
+        pass
+
+if not GPU_AVAILABLE:
+    print(f"[GPU] ℹ️ No GPU acceleration available - using CPU (NumPy)")
+    print(f"[GPU] 💡 For Intel iGPU acceleration, install:")
+    print(f"[GPU]    pip install intel-extension-for-pytorch")
+    print(f"[GPU]    Or: pip install torch  # Then check torch.cuda.is_available()")
+
 # Try to import numba for JIT compilation (optional but gives ~3-5x speedup)
 try:
     from numba import jit, prange
@@ -27,6 +108,307 @@ except ImportError:
             return func
         return decorator
     prange = range
+
+
+# =============================================================================
+# GPU HELPER FUNCTIONS
+# =============================================================================
+# List of torch-like backends (all use similar API)
+TORCH_BACKENDS = ('torch_cuda', 'torch_mps', 'torch_xpu', 'intel_ipex')
+
+# Minimum size for GPU to be beneficial (avoid transfer overhead)
+GPU_MIN_ELEMENTS = 65536  # 256x256
+
+def _get_torch_device():
+    """Get the correct torch device."""
+    if GPU_BACKEND == 'intel_ipex':
+        import torch
+        return torch.device('xpu') if torch.xpu.is_available() else torch.device('cpu')
+    return GPU_DEVICE
+
+def _should_use_gpu(arr):
+    """Check if array is large enough to benefit from GPU."""
+    if not GPU_AVAILABLE:
+        return False
+    return arr.size >= GPU_MIN_ELEMENTS
+
+def to_gpu(arr):
+    """Move numpy array to GPU if available."""
+    if not GPU_AVAILABLE or arr is None:
+        return arr
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        return cp.asarray(arr)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        device = _get_torch_device()
+        return torch.from_numpy(arr.astype(np.float32)).to(device)
+    return arr
+
+def to_cpu(arr):
+    """Move array back to CPU as numpy."""
+    if arr is None:
+        return arr
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        if isinstance(arr, cp.ndarray):
+            return cp.asnumpy(arr)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        if isinstance(arr, torch.Tensor):
+            return arr.detach().cpu().numpy()
+    return arr
+
+def gpu_matmul(a, b):
+    """GPU-accelerated matrix multiplication. Uses GPU only for large matrices."""
+    # Skip GPU for small matrices (transfer overhead > compute benefit)
+    if not _should_use_gpu(a):
+        return a @ b
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        a_gpu = cp.asarray(a) if not isinstance(a, cp.ndarray) else a
+        b_gpu = cp.asarray(b) if not isinstance(b, cp.ndarray) else b
+        return cp.asnumpy(a_gpu @ b_gpu)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        device = _get_torch_device()
+        a_t = torch.from_numpy(a.astype(np.float32)).to(device) if not isinstance(a, torch.Tensor) else a
+        b_t = torch.from_numpy(b.astype(np.float32)).to(device) if not isinstance(b, torch.Tensor) else b
+        return (a_t @ b_t).detach().cpu().numpy()
+    return a @ b
+
+def gpu_softmax(x, axis=-1):
+    """GPU-accelerated softmax."""
+    if not GPU_AVAILABLE:
+        x_max = np.max(x, axis=axis, keepdims=True)
+        exp_x = np.exp(x - x_max)
+        return exp_x / (np.sum(exp_x, axis=axis, keepdims=True) + 1e-10)
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        x_gpu = cp.asarray(x)
+        x_max = cp.max(x_gpu, axis=axis, keepdims=True)
+        exp_x = cp.exp(x_gpu - x_max)
+        result = exp_x / (cp.sum(exp_x, axis=axis, keepdims=True) + 1e-10)
+        return cp.asnumpy(result)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        import torch.nn.functional as F
+        device = _get_torch_device()
+        x_t = torch.from_numpy(x.astype(np.float32)).to(device)
+        return F.softmax(x_t, dim=axis).detach().cpu().numpy()
+    
+    return x
+
+def gpu_gelu(x):
+    """GPU-accelerated GELU activation."""
+    if not GPU_AVAILABLE:
+        return 0.5 * x * (1.0 + np.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        x_gpu = cp.asarray(x)
+        result = 0.5 * x_gpu * (1.0 + cp.tanh(0.7978845608028654 * (x_gpu + 0.044715 * x_gpu * x_gpu * x_gpu)))
+        return cp.asnumpy(result)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        import torch.nn.functional as F
+        device = _get_torch_device()
+        x_t = torch.from_numpy(x.astype(np.float32)).to(device)
+        return F.gelu(x_t).detach().cpu().numpy()
+    
+    return x
+
+def gpu_einsum(subscripts, *operands):
+    """GPU-accelerated einsum for attention operations."""
+    if not GPU_AVAILABLE:
+        return np.einsum(subscripts, *operands)
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        gpu_operands = [cp.asarray(op) for op in operands]
+        result = cp.einsum(subscripts, *gpu_operands)
+        return cp.asnumpy(result)
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        device = _get_torch_device()
+        torch_operands = [torch.from_numpy(op.astype(np.float32)).to(device) for op in operands]
+        result = torch.einsum(subscripts, *torch_operands)
+        return result.detach().cpu().numpy()
+    
+    return np.einsum(subscripts, *operands)
+
+def gpu_batch_matmul(a, b):
+    """GPU-accelerated batched matrix multiplication for attention."""
+    if not GPU_AVAILABLE:
+        return np.matmul(a, b)
+    
+    if GPU_BACKEND == 'cupy':
+        import cupy as cp
+        a_gpu = cp.asarray(a) if not isinstance(a, cp.ndarray) else a
+        b_gpu = cp.asarray(b) if not isinstance(b, cp.ndarray) else b
+        return cp.asnumpy(cp.matmul(a_gpu, b_gpu))
+    elif GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        device = _get_torch_device()
+        a_t = torch.from_numpy(a.astype(np.float32)).to(device) if not isinstance(a, torch.Tensor) else a
+        b_t = torch.from_numpy(b.astype(np.float32)).to(device) if not isinstance(b, torch.Tensor) else b
+        return torch.matmul(a_t, b_t).detach().cpu().numpy()
+    return np.matmul(a, b)
+
+def get_gpu_info():
+    """Get information about GPU acceleration status."""
+    info = {
+        'available': GPU_AVAILABLE,
+        'backend': GPU_BACKEND,
+        'device': str(GPU_DEVICE) if GPU_DEVICE else 'CPU'
+    }
+    
+    if GPU_BACKEND in TORCH_BACKENDS:
+        import torch
+        if GPU_BACKEND == 'torch_cuda':
+            info['device_name'] = torch.cuda.get_device_name(0)
+            info['memory_total'] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        elif GPU_BACKEND == 'intel_ipex' and torch.xpu.is_available():
+            info['device_name'] = torch.xpu.get_device_name(0)
+    
+    return info
+
+
+class GPUWeightCache:
+    """
+    Caches model weights on GPU to avoid repeated transfers.
+    Weights are transferred once and reused for all forward passes.
+    """
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self.cache = {}
+        self.torch = None
+        self.device = None
+        
+        if GPU_BACKEND in TORCH_BACKENDS:
+            import torch
+            self.torch = torch
+            self.device = _get_torch_device()
+    
+    def get_or_cache(self, key: str, arr: np.ndarray):
+        """Get cached GPU tensor or cache the numpy array."""
+        if self.torch is None:
+            return arr
+            
+        if key not in self.cache:
+            self.cache[key] = self.torch.from_numpy(arr.astype(np.float32)).to(self.device)
+        return self.cache[key]
+    
+    def invalidate(self, key: str = None):
+        """Invalidate cache (e.g., after weight update)."""
+        if key:
+            self.cache.pop(key, None)
+        else:
+            self.cache.clear()
+    
+    def to_gpu(self, arr):
+        """Convert numpy to GPU tensor (for inputs, not weights)."""
+        if self.torch is None:
+            return arr
+        return self.torch.from_numpy(arr.astype(np.float32)).to(self.device)
+    
+    def to_cpu(self, tensor):
+        """Convert GPU tensor to numpy."""
+        if self.torch is None or not isinstance(tensor, self.torch.Tensor):
+            return tensor
+        return tensor.detach().cpu().numpy()
+
+
+# Global GPU weight cache
+_gpu_cache = None
+
+def get_gpu_cache():
+    """Get or create the global GPU weight cache."""
+    global _gpu_cache
+    if _gpu_cache is None:
+        _gpu_cache = GPUWeightCache()
+    return _gpu_cache
+
+
+class GPUBatchContext:
+    """
+    Context manager for batched GPU operations.
+    Uses the global weight cache for efficiency.
+    
+    Usage:
+        with GPUBatchContext() as gpu:
+            a = gpu.to_gpu(numpy_array)
+            b = gpu.to_gpu(another_array)
+            c = a @ b  # Stays on GPU
+            d = gpu.gelu(c)  # Stays on GPU
+            result = gpu.to_cpu(d)  # Transfer back only at the end
+    """
+    def __init__(self):
+        self.cache = get_gpu_cache()
+        self.torch = self.cache.torch
+        self.device = self.cache.device
+        
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        # Sync if needed
+        if self.torch and GPU_BACKEND == 'intel_ipex':
+            self.torch.xpu.synchronize()
+    
+    def to_gpu(self, arr):
+        """Move numpy array to GPU tensor."""
+        return self.cache.to_gpu(arr)
+    
+    def to_cpu(self, tensor):
+        """Move GPU tensor to numpy array."""
+        return self.cache.to_cpu(tensor)
+    
+    def get_weight(self, key: str, arr: np.ndarray):
+        """Get cached weight tensor."""
+        return self.cache.get_or_cache(key, arr)
+    
+    def matmul(self, a, b):
+        """GPU matmul that keeps result on GPU."""
+        return a @ b
+    
+    def gelu(self, x):
+        """GPU GELU that keeps result on GPU."""
+        if self.torch:
+            import torch.nn.functional as F
+            return F.gelu(x)
+        return gpu_gelu(x)
+    
+    def softmax(self, x, dim=-1):
+        """GPU softmax that keeps result on GPU."""
+        if self.torch:
+            import torch.nn.functional as F
+            return F.softmax(x, dim=dim)
+        return gpu_softmax(x, axis=dim)
+    
+    def layer_norm(self, x, weight, bias, eps=1e-5):
+        """GPU layer norm."""
+        if self.torch:
+            import torch.nn.functional as F
+            return F.layer_norm(x, x.shape[-1:], weight, bias, eps)
+        # Fallback to manual
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, keepdim=True, unbiased=False)
+        return (x - mean) / (var + eps).sqrt() * weight + bias
 
 # =============================================================================
 # JIT-COMPILED MATH KERNELS (if numba available)
@@ -542,6 +924,10 @@ class BitTransformer:
                 if isinstance(arr, np.ndarray):
                     expert[key] = arr.astype(dtype)
         
+        # Enable GPU mode if available
+        if GPU_AVAILABLE:
+            self._preload_weights_to_gpu()
+        
         # Convert optimizer state if exists
         if hasattr(self, 'm') and self.m:
             for key in self.m:
@@ -559,6 +945,51 @@ class BitTransformer:
         
         mem_savings = 50 if dtype == np.float32 else 75
         print(f"[BitTransformer] ✅ Speed optimization complete (~{mem_savings}% memory reduction)")
+    
+    def _preload_weights_to_gpu(self):
+        """
+        Preload all transformer weights to GPU memory.
+        This eliminates transfer overhead during forward passes.
+        """
+        if not GPU_AVAILABLE:
+            return
+        
+        cache = get_gpu_cache()
+        print(f"[BitTransformer] 🚀 Preloading weights to {GPU_BACKEND}...")
+        
+        # Cache embedding weights
+        cache.get_or_cache('W_embed', self.W_embed)
+        cache.get_or_cache('W_pos_embed', self.W_pos_embed)
+        cache.get_or_cache('W_significance', self.W_significance)
+        
+        # Cache transformer layer weights
+        for i, layer in enumerate(self.layers):
+            for key, arr in layer.items():
+                if isinstance(arr, np.ndarray):
+                    cache.get_or_cache(f'layer{i}_{key}', arr)
+        
+        # Cache output head weights
+        for attr in ['W_flip', 'W_value', 'W_confidence', 'W_router']:
+            if hasattr(self, attr):
+                arr = getattr(self, attr)
+                if isinstance(arr, np.ndarray):
+                    cache.get_or_cache(attr, arr)
+        
+        # Cache expert weights
+        for i, expert in enumerate(self.experts):
+            for key, arr in expert.items():
+                if isinstance(arr, np.ndarray):
+                    cache.get_or_cache(f'expert{i}_{key}', arr)
+        
+        self._gpu_mode = True
+        print(f"[BitTransformer] ✅ Weights cached on GPU")
+    
+    def invalidate_gpu_cache(self):
+        """Call after updating weights to refresh GPU cache."""
+        if GPU_AVAILABLE:
+            cache = get_gpu_cache()
+            cache.invalidate()
+            self._gpu_mode = False
     
     def _rms_norm(self, x: np.ndarray, gamma: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         """
@@ -674,13 +1105,13 @@ class BitTransformer:
         """
         GELU activation (Gaussian Error Linear Unit).
         Used in GPT-2, BERT, and most modern transformers.
-        OPTIMIZED: Uses x*x*x instead of np.power (3x faster).
+        OPTIMIZED: Uses GPU acceleration if available.
         
         GELU(x) = x * Φ(x) where Φ is the CDF of standard normal
         Approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         """
-        # Use x*x*x instead of np.power(x, 3) - much faster!
-        return 0.5 * x * (1.0 + np.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+        # Use GPU-accelerated GELU if available
+        return gpu_gelu(x)
     
     def _gelu_derivative(self, x: np.ndarray) -> np.ndarray:
         """Derivative of GELU for backward pass. OPTIMIZED."""
@@ -689,17 +1120,15 @@ class BitTransformer:
         return cdf + x * pdf
     
     def _softmax(self, x: np.ndarray, axis: int = -1) -> np.ndarray:
-        """Numerically stable softmax."""
-        x_max = np.max(x, axis=axis, keepdims=True)
-        exp_x = np.exp(x - x_max)
-        return exp_x / (np.sum(exp_x, axis=axis, keepdims=True) + 1e-10)
+        """Numerically stable softmax. GPU-accelerated if available."""
+        return gpu_softmax(x, axis=axis)
     
     def _multi_head_attention(self, Q: np.ndarray, K: np.ndarray, V: np.ndarray,
                                W_Q: np.ndarray, W_K: np.ndarray, W_V: np.ndarray,
                                W_O: np.ndarray, mask: np.ndarray = None) -> tuple:
         """
         Multi-Head Scaled Dot-Product Attention.
-        OPTIMIZED: Uses einsum for fused operations.
+        OPTIMIZED: Uses GPU acceleration for matmul operations.
         
         Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
         
@@ -713,37 +1142,35 @@ class BitTransformer:
         """
         seq_len = Q.shape[0]
         
-        # Project Q, K, V (these matmuls are unavoidable)
-        Q_proj = Q @ W_Q  # (seq_len, d_model)
-        K_proj = K @ W_K
-        V_proj = V @ W_V
+        # Project Q, K, V - GPU accelerated matmul
+        Q_proj = gpu_matmul(Q, W_Q)  # (seq_len, d_model)
+        K_proj = gpu_matmul(K, W_K)
+        V_proj = gpu_matmul(V, W_V)
         
         # Reshape for multi-head: (seq_len, num_heads, d_k)
         Q_heads = Q_proj.reshape(seq_len, self.num_heads, self.d_k)
         K_heads = K_proj.reshape(seq_len, self.num_heads, self.d_k)
         V_heads = V_proj.reshape(seq_len, self.num_heads, self.d_k)
         
-        # OPTIMIZED: Use einsum for attention scores (fuses transpose + matmul)
-        # 'shd,thd->hst' = (seq, heads, d_k) x (seq, heads, d_k) -> (heads, seq, seq)
-        scale = 1.0 / np.sqrt(self.d_k)  # Precompute reciprocal
-        attention_scores = np.einsum('shd,thd->hst', Q_heads, K_heads) * scale
+        # GPU-accelerated attention scores using einsum (fuses transpose + matmul)
+        scale = 1.0 / np.sqrt(self.d_k)
+        attention_scores = gpu_einsum('shd,thd->hst', Q_heads, K_heads) * scale
         
         # Apply mask if provided (e.g., causal mask)
         if mask is not None:
             attention_scores = attention_scores + mask * (-1e9)
         
-        # Softmax over keys
+        # Softmax over keys - GPU accelerated
         attention_weights = self._softmax(attention_scores, axis=-1)
         
-        # OPTIMIZED: Use einsum for attention output
-        # 'hst,thd->shd' = (heads, seq, seq) x (seq, heads, d_k) -> (seq, heads, d_k)
-        attention_output = np.einsum('hst,thd->shd', attention_weights, V_heads)
+        # GPU-accelerated attention output using einsum
+        attention_output = gpu_einsum('hst,thd->shd', attention_weights, V_heads)
         
         # Reshape back: (seq_len, num_heads, d_k) -> (seq_len, d_model)
         attention_output = attention_output.reshape(seq_len, self.d_model)
         
-        # Output projection
-        output = attention_output @ W_O
+        # Output projection - GPU accelerated
+        output = gpu_matmul(attention_output, W_O)
         
         # Clip to prevent overflow
         output = np.clip(output, -1e6, 1e6)
@@ -767,23 +1194,25 @@ class BitTransformer:
                        W2: np.ndarray, b2: np.ndarray, W_gate: np.ndarray = None) -> tuple:
         """
         Position-wise Feed-Forward Network with optional gating (SwiGLU-style).
+        GPU-accelerated matrix multiplications.
         
         FFN(x) = W2 * GELU(W1 * x + b1) + b2
         
         With gating (SwiGLU):
         FFN(x) = W2 * (GELU(W1 * x + b1) * sigmoid(W_gate * x)) + b2
         """
-        # First linear + GELU
-        hidden = x @ W1 + b1
+        # First linear + GELU - GPU accelerated
+        hidden = gpu_matmul(x, W1) + b1
         hidden_act = self._gelu(hidden)
         
         # Optional gating mechanism (like SwiGLU in LLaMA)
         if W_gate is not None:
-            gate = 1 / (1 + np.exp(-np.clip(x @ W_gate, -20, 20)))  # Sigmoid with clip
+            gate_input = gpu_matmul(x, W_gate)
+            gate = 1 / (1 + np.exp(-np.clip(gate_input, -20, 20)))  # Sigmoid with clip
             hidden_act = hidden_act * gate
         
-        # Second linear
-        output = hidden_act @ W2 + b2
+        # Second linear - GPU accelerated
+        output = gpu_matmul(hidden_act, W2) + b2
         
         # Clip to prevent overflow
         output = np.clip(output, -1e6, 1e6)
