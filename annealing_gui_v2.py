@@ -233,6 +233,11 @@ class FactorizationGUI:
         self.notebook.add(policy_frame, text="  🤖 Policy Net  ")
         self.create_policy_tab(policy_frame)
         
+        # Tab 6: Transformer Training Metrics (NEW)
+        training_frame = ttk.Frame(self.notebook)
+        self.notebook.add(training_frame, text="  📈 Training  ")
+        self.create_training_tab(training_frame)
+        
         # Bottom status bar
         self.create_status_bar(main_container)
     
@@ -473,15 +478,15 @@ class FactorizationGUI:
         preset_row = ttk.Frame(model_frame)
         preset_row.pack(fill=tk.X, pady=2)
         ttk.Label(preset_row, text="Model Preset:", width=12).pack(side=tk.LEFT)
-        self.model_preset_var = tk.StringVar(value="Medium")
+        self.model_preset_var = tk.StringVar(value="Lean")
         self.model_preset_combo = ttk.Combobox(preset_row, textvariable=self.model_preset_var,
-                                                values=["Light", "Medium", "Heavy", "Ultra", "Custom"],
+                                                values=["Micro", "Turbo", "Lean", "Medium", "Heavy", "Custom", "Auto"],
                                                 state="readonly", width=12)
         self.model_preset_combo.pack(side=tk.LEFT, padx=5)
         self.model_preset_combo.bind("<<ComboboxSelected>>", self._on_model_preset_change)
         
         # Model stats display
-        self.model_stats_var = tk.StringVar(value="📊 ~8M params | 256 dim | 4 layers | 8 heads")
+        self.model_stats_var = tk.StringVar(value="🎯 Recommended for factoring | ~3M params | 256d | 4L | 8H")
         ttk.Label(model_frame, textvariable=self.model_stats_var,
                   font=('TkDefaultFont', 8)).pack(anchor=tk.W, pady=(2, 5))
         
@@ -997,6 +1002,288 @@ class FactorizationGUI:
                                                        bg=colors['bg_secondary'], fg=colors['fg'])
         self.train_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
     
+    def create_training_tab(self, parent):
+        """Create the Transformer Training metrics tab."""
+        colors = ModernStyle.current
+        
+        training_container = ttk.Frame(parent, padding=10)
+        training_container.pack(fill=tk.BOTH, expand=True)
+        
+        # Create scrollable frame
+        canvas = tk.Canvas(training_container, bg=colors['bg'], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(training_container, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # === Model Architecture ===
+        arch_frame = ttk.LabelFrame(scroll_frame, text="🏗️ Transformer Architecture", padding=10)
+        arch_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        arch_grid = ttk.Frame(arch_frame)
+        arch_grid.pack(fill=tk.X)
+        
+        # Row 0
+        ttk.Label(arch_grid, text="Model Dimension:", style='Stats.TLabel').grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.train_d_model = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_d_model.grid(row=0, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(arch_grid, text="Layers:", style='Stats.TLabel').grid(row=0, column=2, sticky=tk.W, padx=20)
+        self.train_layers = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_layers.grid(row=0, column=3, sticky=tk.W, padx=5)
+        
+        # Row 1
+        ttk.Label(arch_grid, text="Attention Heads:", style='Stats.TLabel').grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.train_heads = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_heads.grid(row=1, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(arch_grid, text="FFN Dimension:", style='Stats.TLabel').grid(row=1, column=2, sticky=tk.W, padx=20)
+        self.train_ffn = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_ffn.grid(row=1, column=3, sticky=tk.W, padx=5)
+        
+        # Row 2
+        ttk.Label(arch_grid, text="Experts (MoE):", style='Stats.TLabel').grid(row=2, column=0, sticky=tk.W, padx=5)
+        self.train_experts = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_experts.grid(row=2, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(arch_grid, text="Total Parameters:", style='Stats.TLabel').grid(row=2, column=2, sticky=tk.W, padx=20)
+        self.train_params = ttk.Label(arch_grid, text="-", style='Stats.TLabel')
+        self.train_params.grid(row=2, column=3, sticky=tk.W, padx=5)
+        
+        # === Training Progress ===
+        progress_frame = ttk.LabelFrame(scroll_frame, text="📊 Training Progress", padding=10)
+        progress_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        progress_grid = ttk.Frame(progress_frame)
+        progress_grid.pack(fill=tk.X)
+        
+        # Row 0
+        ttk.Label(progress_grid, text="Training Steps:", style='Stats.TLabel').grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.train_steps = ttk.Label(progress_grid, text="0", style='Stats.TLabel')
+        self.train_steps.grid(row=0, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(progress_grid, text="Learning Rate:", style='Stats.TLabel').grid(row=0, column=2, sticky=tk.W, padx=20)
+        self.train_lr = ttk.Label(progress_grid, text="-", style='Stats.TLabel')
+        self.train_lr.grid(row=0, column=3, sticky=tk.W, padx=5)
+        
+        # Row 1
+        ttk.Label(progress_grid, text="Samples Seen:", style='Stats.TLabel').grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.train_samples = ttk.Label(progress_grid, text="0", style='Stats.TLabel')
+        self.train_samples.grid(row=1, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(progress_grid, text="Context Memory:", style='Stats.TLabel').grid(row=1, column=2, sticky=tk.W, padx=20)
+        self.train_context = ttk.Label(progress_grid, text="0/500", style='Stats.TLabel')
+        self.train_context.grid(row=1, column=3, sticky=tk.W, padx=5)
+        
+        # Row 2: Loss display
+        ttk.Label(progress_grid, text="Recent Avg Loss:", style='Stats.TLabel').grid(row=2, column=0, sticky=tk.W, padx=5)
+        self.train_loss = ttk.Label(progress_grid, text="-", style='Stats.TLabel')
+        self.train_loss.grid(row=2, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(progress_grid, text="Best Diff Found:", style='Stats.TLabel').grid(row=2, column=2, sticky=tk.W, padx=20)
+        self.train_best_diff = ttk.Label(progress_grid, text="-", style='Stats.TLabel')
+        self.train_best_diff.grid(row=2, column=3, sticky=tk.W, padx=5)
+        
+        # === Expert Usage (MoE) ===
+        expert_frame = ttk.LabelFrame(scroll_frame, text="🎭 Expert Usage (Mixture of Experts)", padding=10)
+        expert_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        self.expert_bars_frame = ttk.Frame(expert_frame)
+        self.expert_bars_frame.pack(fill=tk.X)
+        
+        # Will be populated dynamically
+        self.expert_bars = []
+        self.expert_labels = []
+        for i in range(8):  # Max 8 experts
+            row = ttk.Frame(self.expert_bars_frame)
+            row.pack(fill=tk.X, pady=1)
+            
+            label = ttk.Label(row, text=f"Expert {i}:", width=10, style='Stats.TLabel')
+            label.pack(side=tk.LEFT)
+            
+            bar = ttk.Progressbar(row, orient=tk.HORIZONTAL, length=200, mode='determinate')
+            bar.pack(side=tk.LEFT, padx=5)
+            
+            count_label = ttk.Label(row, text="0", width=15, style='Stats.TLabel')
+            count_label.pack(side=tk.LEFT)
+            
+            self.expert_bars.append(bar)
+            self.expert_labels.append(count_label)
+        
+        # === Learned Patterns ===
+        patterns_frame = ttk.LabelFrame(scroll_frame, text="🧬 Learned Patterns", padding=10)
+        patterns_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        patterns_grid = ttk.Frame(patterns_frame)
+        patterns_grid.pack(fill=tk.X)
+        
+        ttk.Label(patterns_grid, text="Successful Patterns:", style='Stats.TLabel').grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.train_success_patterns = ttk.Label(patterns_grid, text="0", style='Stats.TLabel')
+        self.train_success_patterns.grid(row=0, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(patterns_grid, text="Factor History:", style='Stats.TLabel').grid(row=0, column=2, sticky=tk.W, padx=20)
+        self.train_factor_history = ttk.Label(patterns_grid, text="0", style='Stats.TLabel')
+        self.train_factor_history.grid(row=0, column=3, sticky=tk.W, padx=5)
+        
+        # === Bit Importance (Top 10) ===
+        importance_frame = ttk.LabelFrame(scroll_frame, text="🎯 Bit Importance (Attention Weighted)", padding=10)
+        importance_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        self.importance_text = tk.Text(importance_frame, height=6, font=('Consolas', 10),
+                                        bg=colors['bg_secondary'], fg=colors['fg'])
+        self.importance_text.pack(fill=tk.X)
+        self.importance_text.insert(tk.END, "Top attended bit positions will appear here during training...\n")
+        self.importance_text.insert(tk.END, "This shows which bits the transformer focuses on most.\n")
+        self.importance_text.config(state=tk.DISABLED)
+        
+        # === Gradient Statistics ===
+        grad_frame = ttk.LabelFrame(scroll_frame, text="📉 Gradient Statistics", padding=10)
+        grad_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        grad_grid = ttk.Frame(grad_frame)
+        grad_grid.pack(fill=tk.X)
+        
+        ttk.Label(grad_grid, text="Grad Norm (avg):", style='Stats.TLabel').grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.train_grad_norm = ttk.Label(grad_grid, text="-", style='Stats.TLabel')
+        self.train_grad_norm.grid(row=0, column=1, sticky=tk.W, padx=5)
+        
+        ttk.Label(grad_grid, text="Grad Clipped:", style='Stats.TLabel').grid(row=0, column=2, sticky=tk.W, padx=20)
+        self.train_grad_clip = ttk.Label(grad_grid, text="0", style='Stats.TLabel')
+        self.train_grad_clip.grid(row=0, column=3, sticky=tk.W, padx=5)
+        
+        # === Refresh Button ===
+        btn_frame = ttk.Frame(scroll_frame)
+        btn_frame.pack(fill=tk.X, pady=10, padx=5)
+        
+        ttk.Button(btn_frame, text="🔄 Refresh Training Stats", 
+                  command=self.refresh_training_stats).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="📊 Show Loss History", 
+                  command=self.show_loss_history).pack(side=tk.LEFT, padx=5)
+    
+    def refresh_training_stats(self):
+        """Refresh the training statistics display."""
+        if not self.annealer or not hasattr(self.annealer, 'ml_clause_learner'):
+            return
+        
+        ml = self.annealer.ml_clause_learner
+        if not hasattr(ml, 'transformer') or ml.transformer is None:
+            return
+        
+        transformer = ml.transformer
+        
+        # Update architecture info
+        self.train_d_model.config(text=str(getattr(transformer, 'd_model', '-')))
+        self.train_layers.config(text=str(getattr(transformer, 'num_layers', '-')))
+        self.train_heads.config(text=str(getattr(transformer, 'num_heads', '-')))
+        self.train_ffn.config(text=str(getattr(transformer, 'd_ff', '-')))
+        self.train_experts.config(text=str(getattr(transformer, 'num_experts', '-')))
+        
+        # Parameter count
+        if hasattr(transformer, '_count_parameters'):
+            params = transformer._count_parameters()
+            if params > 1_000_000:
+                self.train_params.config(text=f"{params/1_000_000:.2f}M")
+            else:
+                self.train_params.config(text=f"{params:,}")
+        
+        # Training progress
+        self.train_steps.config(text=str(getattr(transformer, 't', 0)))
+        lr = getattr(transformer, 'lr', 0)
+        self.train_lr.config(text=f"{lr:.2e}" if lr else "-")
+        
+        # Samples from MLClauseLearner
+        self.train_samples.config(text=f"{getattr(ml, 'num_samples', 0):,}")
+        
+        # Context memory
+        ctx_size = len(getattr(transformer, 'context_memory', []))
+        max_ctx = getattr(transformer, 'max_context', 500)
+        self.train_context.config(text=f"{ctx_size}/{max_ctx}")
+        
+        # Loss history
+        loss_hist = getattr(transformer, 'loss_history', [])
+        if loss_hist:
+            recent_loss = sum(loss_hist[-100:]) / min(len(loss_hist), 100)
+            self.train_loss.config(text=f"{recent_loss:.4f}")
+        
+        # Best diff
+        best_diff = getattr(transformer, 'best_diff', float('inf'))
+        if best_diff != float('inf'):
+            if isinstance(best_diff, int) and best_diff.bit_length() > 50:
+                self.train_best_diff.config(text=f"{best_diff.bit_length()} bits")
+            else:
+                self.train_best_diff.config(text=f"{best_diff:,.0f}")
+        
+        # Expert usage
+        expert_usage = getattr(transformer, 'expert_usage_count', None)
+        if expert_usage is not None:
+            total_usage = max(sum(expert_usage), 1)
+            for i, count in enumerate(expert_usage):
+                if i < len(self.expert_bars):
+                    pct = (count / total_usage) * 100
+                    self.expert_bars[i]['value'] = pct
+                    self.expert_labels[i].config(text=f"{int(count):,} ({pct:.1f}%)")
+        
+        # Patterns
+        success_patterns = len(getattr(transformer, 'successful_patterns', []))
+        self.train_success_patterns.config(text=str(success_patterns))
+        
+        factor_hist = len(getattr(transformer, 'factor_history', []))
+        self.train_factor_history.config(text=str(factor_hist))
+        
+        # Bit importance (from last forward pass cache if available)
+        cache = getattr(transformer, '_cache', {})
+        if 'flip_scores' in cache:
+            scores = cache['flip_scores']
+            top_indices = sorted(range(len(scores)), key=lambda i: abs(scores[i]), reverse=True)[:10]
+            
+            self.importance_text.config(state=tk.NORMAL)
+            self.importance_text.delete(1.0, tk.END)
+            self.importance_text.insert(tk.END, "Top 10 Most Important Bits (by attention):\n\n")
+            for rank, idx in enumerate(top_indices):
+                score = scores[idx]
+                direction = "↑ flip" if score > 0 else "↓ keep"
+                self.importance_text.insert(tk.END, f"  #{rank+1}: Bit {idx:4d}  score={score:+.4f}  {direction}\n")
+            self.importance_text.config(state=tk.DISABLED)
+    
+    def show_loss_history(self):
+        """Show loss history in a popup or log."""
+        if not self.annealer or not hasattr(self.annealer, 'ml_clause_learner'):
+            messagebox.showinfo("Loss History", "No training data available yet.")
+            return
+        
+        ml = self.annealer.ml_clause_learner
+        if not hasattr(ml, 'transformer') or ml.transformer is None:
+            messagebox.showinfo("Loss History", "Transformer not initialized yet.")
+            return
+        
+        loss_hist = getattr(ml.transformer, 'loss_history', [])
+        if not loss_hist:
+            messagebox.showinfo("Loss History", "No loss history recorded yet.")
+            return
+        
+        # Show summary in message box
+        recent = loss_hist[-100:] if len(loss_hist) > 100 else loss_hist
+        avg_recent = sum(recent) / len(recent)
+        min_loss = min(loss_hist)
+        max_loss = max(loss_hist)
+        
+        msg = f"Loss History Summary:\n\n"
+        msg += f"Total training steps: {len(loss_hist):,}\n"
+        msg += f"Recent avg (last 100): {avg_recent:.6f}\n"
+        msg += f"Min loss: {min_loss:.6f}\n"
+        msg += f"Max loss: {max_loss:.6f}\n\n"
+        msg += f"Last 10 losses:\n"
+        for i, loss in enumerate(loss_hist[-10:]):
+            msg += f"  {len(loss_hist)-10+i+1}: {loss:.6f}\n"
+        
+        messagebox.showinfo("Loss History", msg)
+    
     def create_status_bar(self, parent):
         """Create the bottom status bar."""
         colors = ModernStyle.current
@@ -1251,12 +1538,15 @@ Tips:
         """Handle model preset dropdown change."""
         preset = self.model_preset_var.get()
         
-        # Model presets: (d_model, num_layers, num_heads, num_experts, params_approx)
+        # Model presets optimized for factorization (2x FFN, not 4x like LLMs)
+        # Format: (d_model, num_layers, num_heads, num_experts, params_approx, description)
         presets = {
-            "Light": (128, 2, 4, 2, "~2M"),
-            "Medium": (256, 4, 8, 4, "~8M"),
-            "Heavy": (512, 6, 16, 4, "~33M"),
-            "Ultra": (768, 8, 16, 8, "~76M"),
+            "Micro":  (64,  2, 4, 2, "~0.5M", "🔬 Minimal - fast testing"),
+            "Turbo":  (128, 2, 4, 2, "~1M",   "⚡ Speed optimized"),
+            "Lean":   (256, 4, 8, 4, "~3M",   "🎯 Recommended for factoring"),
+            "Medium": (256, 4, 8, 4, "~3M",   "📊 Balanced"),
+            "Heavy":  (384, 6, 12, 4, "~12M", "💪 More capacity"),
+            "Auto":   (256, 4, 8, 4, "~3M",   "📐 Auto-scale by problem size"),
         }
         
         if preset == "Custom":
@@ -1268,12 +1558,12 @@ Tips:
             self.custom_model_frame.pack_forget()
             
             if preset in presets:
-                d_model, num_layers, num_heads, num_experts, params = presets[preset]
+                d_model, num_layers, num_heads, num_experts, params, desc = presets[preset]
                 self.dmodel_var.set(d_model)
                 self.nlayers_var.set(num_layers)
                 self.nheads_var.set(num_heads)
                 self.nexperts_var.set(num_experts)
-                self.model_stats_var.set(f"📊 {params} params | {d_model} dim | {num_layers} layers | {num_heads} heads | {num_experts} experts")
+                self.model_stats_var.set(f"{desc} | {params} params | {d_model}d | {num_layers}L | {num_heads}H")
     
     def get_model_settings(self) -> dict:
         """Get the current transformer model settings."""
@@ -1888,6 +2178,18 @@ Tips:
             except Exception as e:
                 self.stat_bit_accuracy.config(text="calc err")
                 self.progress_detail_label.config(text=f"  (error: {str(e)[:30]})")
+        
+        # Update training stats (every 2 seconds to reduce overhead)
+        if hasattr(self, '_training_update_counter'):
+            self._training_update_counter += 1
+            if self._training_update_counter >= 4:  # Every 4th update (2 seconds)
+                self._training_update_counter = 0
+                try:
+                    self.refresh_training_stats()
+                except Exception:
+                    pass
+        else:
+            self._training_update_counter = 0
         
         # Schedule next update
         self.root.after(500, self.update_stats)
