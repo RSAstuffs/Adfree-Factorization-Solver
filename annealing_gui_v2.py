@@ -305,13 +305,29 @@ class FactorizationGUI:
         temp_frame = ttk.LabelFrame(scroll_frame, text="🌡️ Temperature Schedule", padding=10)
         temp_frame.pack(fill=tk.X, pady=5, padx=5)
         
-        ttk.Label(temp_frame, text="Initial Temperature:").pack(anchor=tk.W)
-        self.init_temp_var = tk.StringVar(value="50000")
-        ttk.Entry(temp_frame, textvariable=self.init_temp_var, width=15).pack(anchor=tk.W, pady=(2, 5))
+        # Auto-scale checkbox
+        self.auto_temp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(temp_frame, text="Auto-scale by N size (recommended)", 
+                       variable=self.auto_temp_var,
+                       command=self._toggle_temp_entries).pack(anchor=tk.W, pady=(0, 5))
         
-        ttk.Label(temp_frame, text="Final Temperature:").pack(anchor=tk.W)
-        self.final_temp_var = tk.StringVar(value="0.1")
-        ttk.Entry(temp_frame, textvariable=self.final_temp_var, width=15).pack(anchor=tk.W, pady=(2, 5))
+        # Manual temp entries (disabled by default when auto-scale is on)
+        self.temp_entries_frame = ttk.Frame(temp_frame)
+        self.temp_entries_frame.pack(fill=tk.X)
+        
+        ttk.Label(self.temp_entries_frame, text="Initial Temperature:").pack(anchor=tk.W)
+        self.init_temp_var = tk.StringVar(value="Auto")
+        self.init_temp_entry = ttk.Entry(self.temp_entries_frame, textvariable=self.init_temp_var, width=15, state='disabled')
+        self.init_temp_entry.pack(anchor=tk.W, pady=(2, 5))
+        
+        ttk.Label(self.temp_entries_frame, text="Final Temperature:").pack(anchor=tk.W)
+        self.final_temp_var = tk.StringVar(value="Auto")
+        self.final_temp_entry = ttk.Entry(self.temp_entries_frame, textvariable=self.final_temp_var, width=15, state='disabled')
+        self.final_temp_entry.pack(anchor=tk.W, pady=(2, 5))
+        
+        # Info label about auto-scaling
+        self.temp_info_label = ttk.Label(temp_frame, text="📐 Temp scales: 100×(1+log₂(N_bits))", foreground='gray')
+        self.temp_info_label.pack(anchor=tk.W, pady=(2, 0))
         
         # === Convergence Settings ===
         conv_frame = ttk.LabelFrame(scroll_frame, text="🎯 Convergence Settings", padding=10)
@@ -858,8 +874,9 @@ Tips:
             self.pairs_var.set("14")
         self.steps_var.set("80")
         self.reads_var.set("15")
-        self.init_temp_var.set("50000")
-        self.final_temp_var.set("0.1")
+        # Enable auto-scale temperature
+        self.auto_temp_var.set(True)
+        self._toggle_temp_entries()
         self.max_restarts_var.set("0")
         self.state_file_var.set("state_2021.json")
         total_pairs, bits, info = self._calculate_optimal_pairs(2021)
@@ -873,8 +890,9 @@ Tips:
             self.pairs_var.set("10")
         self.steps_var.set("50")
         self.reads_var.set("10")
-        self.init_temp_var.set("10000")
-        self.final_temp_var.set("0.1")
+        # Enable auto-scale temperature
+        self.auto_temp_var.set(True)
+        self._toggle_temp_entries()
         self.max_restarts_var.set("0")
         self.state_file_var.set("state_143.json")
         total_pairs, bits, info = self._calculate_optimal_pairs(143)
@@ -888,8 +906,9 @@ Tips:
             self.pairs_var.set("6")
         self.steps_var.set("30")
         self.reads_var.set("5")
-        self.init_temp_var.set("1000")
-        self.final_temp_var.set("0.1")
+        # Enable auto-scale temperature
+        self.auto_temp_var.set(True)
+        self._toggle_temp_entries()
         self.max_restarts_var.set("0")
         self.state_file_var.set("state_15.json")
         total_pairs, bits, info = self._calculate_optimal_pairs(15)
@@ -910,6 +929,23 @@ Tips:
                 self.log(f"📋 Custom N={n} - {total_pairs} pairs {info}", 'info')
             except ValueError:
                 messagebox.showerror("Error", "Invalid number")
+    
+    def _toggle_temp_entries(self):
+        """Toggle temperature entry fields based on auto-scale checkbox."""
+        if self.auto_temp_var.get():
+            # Auto-scale enabled - disable manual entries
+            self.init_temp_entry.config(state='disabled')
+            self.final_temp_entry.config(state='disabled')
+            self.init_temp_var.set("Auto")
+            self.final_temp_var.set("Auto")
+            self.temp_info_label.config(text="📐 Temp scales: 100×(1+log₂(N_bits))")
+        else:
+            # Manual mode - enable entries with default values
+            self.init_temp_entry.config(state='normal')
+            self.final_temp_entry.config(state='normal')
+            self.init_temp_var.set("1000")
+            self.final_temp_var.set("0.01")
+            self.temp_info_label.config(text="⚠️ Manual mode - adjust for your N size")
     
     def browse_state_file(self):
         """Browse for state file."""
@@ -1066,8 +1102,15 @@ Tips:
             num_pairs = int(self.pairs_var.get())
             num_steps = int(self.steps_var.get())
             num_reads = int(self.reads_var.get())
-            init_temp = float(self.init_temp_var.get())
-            final_temp = float(self.final_temp_var.get())
+            
+            # Temperature - None means auto-scale based on N
+            if self.auto_temp_var.get():
+                init_temp = None  # Auto-scale
+                final_temp = None
+            else:
+                init_temp = float(self.init_temp_var.get())
+                final_temp = float(self.final_temp_var.get())
+            
             max_restarts = int(self.max_restarts_var.get())
             state_file = self.state_file_var.get()
             run_converge = self.converge_var.get()
@@ -1110,7 +1153,12 @@ Tips:
             self.log(f"Triangle pairs: {num_pairs} total ({half_pairs} for p, {half_pairs} for q)")
             self.log(f"  → p can be up to {2**half_pairs - 1}, q can be up to {2**half_pairs - 1}")
             self.log(f"Steps: {num_steps}, Reads: {num_reads}")
-            self.log(f"Temperature: {init_temp} → {final_temp}")
+            if init_temp is None:
+                n_bits = N.bit_length()
+                auto_init = 100.0 * (1 + (n_bits.bit_length() if n_bits > 0 else 1))  # approx
+                self.log(f"Temperature: Auto-scaled for {n_bits}-bit N (~{auto_init:.0f} → auto)")
+            else:
+                self.log(f"Temperature: {init_temp} → {final_temp}")
             self.log(f"Convergence mode: {run_converge}")
             self.log("")
             
@@ -1139,7 +1187,13 @@ Tips:
             from incremental_annealing_with_logging import IncrementalQuantumAnnealing
             
             log_file = "annealing_gui.log"
-            self.annealer = IncrementalQuantumAnnealing(N, num_pairs, log_file, init_temp, final_temp)
+            # Pass state_file to init so it can load existing state before starting
+            self.annealer = IncrementalQuantumAnnealing(
+                N, num_pairs, log_file, 
+                initial_temp=init_temp, 
+                final_temp=final_temp,
+                state_file=state_file
+            )
             
             # Load policy network if specified
             policy_file = self.policy_file_var.get() if hasattr(self, 'policy_file_var') else ""
